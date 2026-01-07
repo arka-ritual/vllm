@@ -44,6 +44,8 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        lookahead_token_ids: list[int] | None = None,
+        lookahead_threshold: float | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -137,6 +139,10 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Lookahead tokens for early termination feature
+        self.lookahead_token_ids = lookahead_token_ids
+        self.lookahead_threshold = lookahead_threshold
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -158,6 +164,8 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            lookahead_token_ids=request.lookahead_token_ids,
+            lookahead_threshold=request.lookahead_threshold,
         )
 
     def append_output_token_ids(
@@ -255,6 +263,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
+    FINISHED_LOOKAHEAD = enum.auto()
 
     def __str__(self):
         return self.name
@@ -278,4 +287,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
+    RequestStatus.FINISHED_LOOKAHEAD: FinishReason.LOOKAHEAD,
 }

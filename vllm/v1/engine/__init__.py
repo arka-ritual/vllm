@@ -19,12 +19,12 @@ from vllm.v1.serial_utils import UtilityResult
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
-FINISH_REASON_STRINGS = ("stop", "length", "abort", "error")
+FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "lookahead")
 
 
 class FinishReason(enum.IntEnum):
     """
-    Reason a request finished - stop, length, abort, or error.
+    Reason a request finished - stop, length, abort, error, or lookahead.
 
     Int rather than Str for more compact serialization.
 
@@ -33,6 +33,7 @@ class FinishReason(enum.IntEnum):
     abort - aborted by client
     error - retryable request-level internal error (e.g., KV load failure).
             Invariant: always converted to 500 Internal Server Error.
+    lookahead - lookahead tokens accepted (sum of logprobs exceeded threshold)
 
     """
 
@@ -40,6 +41,7 @@ class FinishReason(enum.IntEnum):
     LENGTH = 1
     ABORT = 2
     ERROR = 3
+    LOOKAHEAD = 4
 
     def __str__(self):
         return FINISH_REASON_STRINGS[self.value]
@@ -80,6 +82,12 @@ class EngineCoreRequest(
     # to the request_id field, see InputProcessor.assign_request_id().
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
+
+    # Lookahead tokens for early termination feature.
+    # If set, these tokens are appended to context during generation.
+    # If sum(lookahead_logprobs) > threshold, terminate and append them.
+    lookahead_token_ids: list[int] | None = None
+    lookahead_threshold: float | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -1071,6 +1071,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        lookahead_terminated = model_runner_output.lookahead_terminated
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1148,8 +1149,15 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # Check for lookahead termination
+            if req_id in lookahead_terminated:
+                # Use lookahead tokens instead of sampled tokens
+                new_token_ids = lookahead_terminated[req_id]
+                request.append_output_token_ids(new_token_ids)
+                request.status = RequestStatus.FINISHED_LOOKAHEAD
+                stopped = True
             # Check for stop and update request status.
-            if new_token_ids:
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
