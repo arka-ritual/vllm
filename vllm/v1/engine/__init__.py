@@ -18,23 +18,25 @@ from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
-FINISH_REASON_STRINGS = ("stop", "length", "abort")
+FINISH_REASON_STRINGS = ("stop", "length", "abort", "lookahead")
 
 
 class FinishReason(enum.IntEnum):
     """
-    Reason a request finished - stop, length, or abort.
+    Reason a request finished - stop, length, abort, or lookahead.
 
     Int rather than Str for more compact serialization.
 
     stop - a stop string was emitted
     length - max_tokens was consumed, or max_model_len was reached
     abort - aborted for another reason
+    lookahead - lookahead tokens accepted (sum of logprobs exceeded threshold)
 
     """
     STOP = 0
     LENGTH = 1
     ABORT = 2
+    LOOKAHEAD = 3
 
     def __str__(self):
         return FINISH_REASON_STRINGS[self.value]
@@ -68,6 +70,12 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Optional[Mapping[str, str]] = None
+
+    # Lookahead tokens for early termination feature.
+    # If set, these tokens are appended to context during generation.
+    # If sum(lookahead_logprobs) > threshold, terminate and append them.
+    lookahead_token_ids: Optional[list[int]] = None
+    lookahead_threshold: Optional[float] = None
 
 
 class EngineCoreEventType(enum.IntEnum):

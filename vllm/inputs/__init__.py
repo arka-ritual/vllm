@@ -3,10 +3,11 @@
 
 from .data import (DataPrompt, DecoderOnlyInputs, EmbedsInputs, EmbedsPrompt,
                    EncoderDecoderInputs, ExplicitEncoderDecoderPrompt,
-                   ProcessorInputs, PromptType, SingletonInputs,
+                   LookaheadPrompt, ProcessorInputs, PromptType, SingletonInputs,
                    SingletonPrompt, TextPrompt, TokenInputs, TokensPrompt,
                    build_explicit_enc_dec_prompt, embeds_inputs,
-                   to_enc_dec_tuple_list, token_inputs, zip_enc_dec_prompts)
+                   is_lookahead_prompt, to_enc_dec_tuple_list, token_inputs,
+                   zip_enc_dec_prompts)
 from .registry import (DummyData, InputContext, InputProcessingContext,
                        InputRegistry)
 
@@ -21,6 +22,7 @@ __all__ = [
     "DataPrompt",
     "TextPrompt",
     "TokensPrompt",
+    "LookaheadPrompt",
     "PromptType",
     "SingletonPrompt",
     "ExplicitEncoderDecoderPrompt",
@@ -34,6 +36,7 @@ __all__ = [
     "ProcessorInputs",
     "SingletonInputs",
     "build_explicit_enc_dec_prompt",
+    "is_lookahead_prompt",
     "to_enc_dec_tuple_list",
     "zip_enc_dec_prompts",
     "INPUT_REGISTRY",

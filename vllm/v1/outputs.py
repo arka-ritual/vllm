@@ -114,6 +114,11 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
 
+    # Lookahead termination: req_id -> lookahead_token_ids
+    # For requests where lookahead threshold was exceeded,
+    # contains the lookahead tokens to append to output.
+    lookahead_terminated: dict[str, list[int]] = field(default_factory=dict)
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

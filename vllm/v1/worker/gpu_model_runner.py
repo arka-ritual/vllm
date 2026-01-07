@@ -3,11 +3,13 @@
 
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
@@ -103,6 +105,56 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 logger = init_logger(__name__)
+
+
+# Simple profiler for lookahead overhead analysis
+class _LookaheadProfiler:
+    """Accumulates timing stats for lookahead overhead analysis."""
+    enabled = os.environ.get("PROFILE_LOOKAHEAD", "0") == "1"
+    stats: dict[str, list[float]] = {}
+    iteration_count = 0
+
+    @classmethod
+    def reset(cls):
+        cls.stats = {}
+        cls.iteration_count = 0
+
+    @classmethod
+    def record(cls, name: str, elapsed_ms: float):
+        if not cls.enabled:
+            return
+        if name not in cls.stats:
+            cls.stats[name] = []
+        cls.stats[name].append(elapsed_ms)
+
+    @classmethod
+    def report(cls):
+        if not cls.enabled or not cls.stats:
+            return
+        print("\n" + "=" * 60)
+        print("LOOKAHEAD PROFILER REPORT")
+        print("=" * 60)
+        for name, times in sorted(cls.stats.items()):
+            avg = sum(times) / len(times)
+            total = sum(times)
+            print(f"{name}: avg={avg:.3f}ms, total={total:.1f}ms, count={len(times)}")
+        print("=" * 60)
+
+
+@dataclass
+class LookaheadMetadata:
+    """Metadata for lookahead token checking."""
+    # req_id -> (logits_start_idx, num_tokens, lookahead_token_ids, threshold)
+    request_info: dict[str, tuple[int, int, list[int], float]]
+    # Indices into the full logits tensor to extract lookahead logits
+    # Shape: [total_lookahead_positions]
+    logits_indices: Optional[torch.Tensor]
+    # Total number of lookahead tokens across all requests
+    total_lookahead_tokens: int
+
+    @classmethod
+    def empty(cls) -> "LookaheadMetadata":
+        return cls(request_info={}, logits_indices=None, total_lookahead_tokens=0)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -1731,6 +1783,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
+            lookahead_terminated={},  # Pooling models don't use lookahead
         )
 
     def _preprocess(
@@ -1864,6 +1917,65 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self._update_states_after_model_execute(output_token_ids)
 
         return sampler_output
+
+    def _check_lookahead_termination(
+        self,
+        logits: Optional[torch.Tensor],
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, list[int]]:
+        """
+        Check if any requests with lookahead tokens should terminate early.
+
+        For each request with lookahead tokens configured, compute the log
+        probabilities of those tokens at the current position. If the sum
+        exceeds the threshold, mark the request for early termination.
+
+        Returns:
+            Dict mapping req_id -> lookahead_token_ids for terminated requests.
+        """
+        lookahead_terminated: dict[str, list[int]] = {}
+
+        if logits is None:
+            return lookahead_terminated
+
+        # Check each request in the batch
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            if req_id not in self.input_batch.lookahead_config:
+                continue
+
+            lookahead_token_ids, threshold = self.input_batch.lookahead_config[
+                req_id]
+
+            # Get the logits for this request's last position
+            # We need to find the position in the logits tensor
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_scheduled == 0:
+                continue
+
+            # For decode, the last token position contains the logits
+            # For the current batch ordering, we use req_idx
+            try:
+                req_logits = logits[req_idx]  # [vocab_size]
+            except IndexError:
+                continue
+
+            # Compute log probabilities for lookahead tokens
+            log_probs = torch.log_softmax(req_logits, dim=-1)
+
+            total_log_prob = 0.0
+            for token_id in lookahead_token_ids:
+                if token_id < len(log_probs):
+                    total_log_prob += log_probs[token_id].item()
+
+            # Check if sum of log probs exceeds threshold
+            if total_log_prob > threshold:
+                lookahead_terminated[req_id] = lookahead_token_ids
+                logger.debug(
+                    f"Lookahead termination for {req_id}: "
+                    f"sum_logprob={total_log_prob:.3f} > threshold={threshold}"
+                )
+
+        return lookahead_terminated
 
     def _bookkeeping_sync(
         self, scheduler_output: "SchedulerOutput",
@@ -2147,6 +2259,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
 
+        # Check for lookahead termination
+        lookahead_terminated = self._check_lookahead_termination(
+            logits, scheduler_output)
+
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2156,6 +2272,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            lookahead_terminated=lookahead_terminated,
         )
 
         if not self.use_async_scheduling:

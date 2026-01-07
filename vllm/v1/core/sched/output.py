@@ -36,6 +36,10 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
 
+    # Lookahead tokens for early termination feature
+    lookahead_token_ids: list[int] | None = None
+    lookahead_threshold: float | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -53,6 +57,8 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            lookahead_token_ids=request.lookahead_token_ids,
+            lookahead_threshold=request.lookahead_threshold,
         )
 
     def __repr__(self):

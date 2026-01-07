@@ -39,6 +39,8 @@ class Request:
         trace_headers: Optional[Mapping[str, str]] = None,
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
+        lookahead_token_ids: Optional[list[int]] = None,
+        lookahead_threshold: Optional[float] = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -119,6 +121,10 @@ class Request:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
 
+        # Lookahead tokens for early termination feature
+        self.lookahead_token_ids = lookahead_token_ids
+        self.lookahead_threshold = lookahead_threshold
+
     @classmethod
     def from_engine_core_request(
         cls, request: EngineCoreRequest,
@@ -141,6 +147,8 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            lookahead_token_ids=request.lookahead_token_ids,
+            lookahead_threshold=request.lookahead_threshold,
         )
 
     def append_output_token_ids(
@@ -211,6 +219,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
+    FINISHED_LOOKAHEAD = enum.auto()
 
     def __str__(self):
         return self.name
@@ -234,4 +243,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
+    RequestStatus.FINISHED_LOOKAHEAD: FinishReason.LOOKAHEAD,
 }

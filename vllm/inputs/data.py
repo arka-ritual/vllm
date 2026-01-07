@@ -46,6 +46,48 @@ class TextPrompt(TypedDict):
     """
 
 
+class LookaheadPrompt(TypedDict):
+    """Schema for a prompt with lookahead tokens for early termination.
+
+    Lookahead tokens are appended to the context during generation. If the
+    sum of their log probabilities exceeds the threshold, generation terminates
+    early and the lookahead tokens are appended to the output.
+    """
+
+    prompt: str
+    """The input text to be tokenized before passing to the model."""
+
+    lookahead_tokens: str | list[int]
+    """
+    The lookahead tokens to probe. Can be a string (which will be tokenized)
+    or a list of token IDs.
+    """
+
+    lookahead_threshold: float
+    """
+    The threshold for early termination. If sum(lookahead_logprobs) > threshold,
+    generation terminates and lookahead tokens are appended to the output.
+    Typical values are negative (e.g., -3.0). More negative = stricter.
+    """
+
+    multi_modal_data: NotRequired[MultiModalDataDict | None]
+    """
+    Optional multi-modal data to pass to the model,
+    if the model supports it.
+    """
+
+    mm_processor_kwargs: NotRequired[dict[str, Any] | None]
+    """
+    Optional multi-modal processor kwargs to be forwarded to the
+    multimodal input mapper & processor.
+    """
+
+    cache_salt: NotRequired[str]
+    """
+    Optional cache salt to be used for prefix caching.
+    """
+
+
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
 
@@ -108,29 +150,34 @@ class DataPrompt(TypedDict):
     """The input data format"""
 
 
-SingletonPrompt = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt]
+SingletonPrompt = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt, LookaheadPrompt]
 """
 Set of possible schemas for a single prompt:
 
 - A text prompt ([`str`][] or [`TextPrompt`][vllm.inputs.data.TextPrompt])
 - A tokenized prompt ([`TokensPrompt`][vllm.inputs.data.TokensPrompt])
 - An embeddings prompt ([`EmbedsPrompt`][vllm.inputs.data.EmbedsPrompt])
+- A lookahead prompt ([`LookaheadPrompt`][vllm.inputs.data.LookaheadPrompt])
 
 Note that "singleton" is as opposed to a data structure
 which encapsulates multiple prompts, i.e. of the sort
 which may be utilized for encoder/decoder models when
 the user desires to express both the encoder & decoder
-prompts explicitly, i.e. 
+prompts explicitly, i.e.
 [`ExplicitEncoderDecoderPrompt`][vllm.inputs.data.ExplicitEncoderDecoderPrompt]
 
-A prompt of type [`SingletonPrompt`][vllm.inputs.data.SingletonPrompt] may be 
+A prompt of type [`SingletonPrompt`][vllm.inputs.data.SingletonPrompt] may be
 employed as (1) input to a decoder-only model, (2) input to
 the encoder of an encoder/decoder model, in the scenario
 where the decoder-prompt is not specified explicitly, or
 (3) as a member of a larger data structure encapsulating
-more than one prompt, i.e. 
+more than one prompt, i.e.
 [`ExplicitEncoderDecoderPrompt`][vllm.inputs.data.ExplicitEncoderDecoderPrompt]
 """
+
+
+def is_lookahead_prompt(prompt: SingletonPrompt) -> TypeIs[LookaheadPrompt]:
+    return isinstance(prompt, dict) and "lookahead_tokens" in prompt
 
 
 def is_tokens_prompt(prompt: SingletonPrompt) -> TypeIs[TokensPrompt]:

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Literal, Optional, Union
 
 from vllm.config import VllmConfig
-from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
+from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs, is_lookahead_prompt
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.lora.request import LoRARequest
@@ -421,6 +421,26 @@ class Processor:
                         identifier=decoder_mm_hashes[modality][idx],
                         mm_position=decoder_mm_positions[modality][idx]))
 
+        # Extract lookahead tokens and threshold if this is a LookaheadPrompt
+        lookahead_token_ids: Optional[list[int]] = None
+        lookahead_threshold: Optional[float] = None
+        if is_lookahead_prompt(prompt):
+            lookahead_threshold = prompt.get("lookahead_threshold")
+            lookahead_tokens = prompt.get("lookahead_tokens")
+            if lookahead_tokens is not None:
+                if isinstance(lookahead_tokens, str):
+                    # Tokenize the lookahead string
+                    if self.tokenizer is None:
+                        raise ValueError(
+                            "Cannot use string lookahead_tokens with "
+                            "skip_tokenizer_init=True. Use token IDs instead."
+                        )
+                    lookahead_token_ids = self.tokenizer.encode(
+                        lookahead_tokens, add_special_tokens=False
+                    )
+                else:
+                    lookahead_token_ids = list(lookahead_tokens)
+
         return decoder_inputs.get("prompt"), EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=decoder_inputs["prompt_token_ids"],
@@ -434,6 +454,8 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            lookahead_token_ids=lookahead_token_ids,
+            lookahead_threshold=lookahead_threshold,
         )
 
     def _validate_model_inputs(self,
