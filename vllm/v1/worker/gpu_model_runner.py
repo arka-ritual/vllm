@@ -1308,8 +1308,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                # Use extended size when lookahead is active
+                slot_mapping_size = (total_num_tokens_extended
+                                     if total_lookahead_extra > 0
+                                     else total_num_scheduled_tokens)
                 slot_mapping = torch.zeros(
-                    (total_num_scheduled_tokens, ),
+                    (slot_mapping_size, ),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1317,16 +1321,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs]
-                slot_mapping = blk_table.slot_mapping[:
-                                                      total_num_scheduled_tokens]
+                # Use extended slot_mapping size when lookahead is active
+                slot_mapping_size = (total_num_tokens_extended
+                                     if total_lookahead_extra > 0
+                                     else total_num_scheduled_tokens)
+                slot_mapping = blk_table.slot_mapping[:slot_mapping_size]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode.
-                blk_table.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
+                blk_table.slot_mapping[slot_mapping_size:].fill_(-1)
                 num_common_prefix_blocks = (
                     scheduler_output.
                     num_common_prefix_blocks[kv_cache_group_id])
 
+            # When lookahead is active, use extended token counts
+            actual_num_tokens = (total_num_tokens_extended
+                                 if total_lookahead_extra > 0
+                                 else total_num_scheduled_tokens)
+            actual_max_query_len = (int(num_tokens_extended.max())
+                                    if total_lookahead_extra > 0
+                                    else max_num_scheduled_tokens)
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc_cpu,
@@ -1334,8 +1348,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 seq_lens_cpu=seq_lens_cpu,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 num_reqs=num_reqs,
-                num_actual_tokens=total_num_scheduled_tokens,
-                max_query_len=max_num_scheduled_tokens,
+                num_actual_tokens=actual_num_tokens,
+                max_query_len=actual_max_query_len,
                 max_seq_len=max_seq_len,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
