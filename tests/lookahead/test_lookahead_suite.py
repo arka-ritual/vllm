@@ -161,16 +161,18 @@ def test_batched_generation_with_threshold():
     llm = create_llm()
 
     # Create mixed batch
+    # NOTE: EOS is now automatically appended to lookahead tokens, so thresholds
+    # must be more lenient to account for P(EOS | context, lookahead_tokens)
     prompts = [
         # Regular prompt (baseline)
         "The capital of France is",
 
         # LookaheadPrompt with very negative threshold (should trigger quickly)
-        # Looking for " Paris" which is very likely
+        # Looking for " Paris" + EOS, threshold accounts for P(" Paris") + P(EOS)
         LookaheadPrompt(
             prompt="The capital of France is",
             lookahead_tokens=" Paris",
-            lookahead_threshold=-5.0,  # Very lenient, should trigger
+            lookahead_threshold=-30.0,  # Very lenient to account for EOS
         ),
 
         # LookaheadPrompt with threshold=0 (should NOT trigger)
@@ -187,14 +189,14 @@ def test_batched_generation_with_threshold():
         LookaheadPrompt(
             prompt="Python is a programming language that",
             lookahead_tokens=" XYZZY",
-            lookahead_threshold=-3.0,  # Reasonable threshold, but unlikely token
+            lookahead_threshold=-10.0,  # Unlikely token still won't trigger
         ),
 
         # LookaheadPrompt with likely continuation
         LookaheadPrompt(
             prompt="2 + 2 =",
             lookahead_tokens=" 4",
-            lookahead_threshold=-8.0,  # More lenient threshold for triggering
+            lookahead_threshold=-25.0,  # Lenient to account for EOS
         ),
     ]
 
@@ -763,10 +765,11 @@ def test_low_threshold_always_triggers():
 
     This verifies:
     1. All lookahead prompts trigger (finish_reason == "lookahead")
-    2. Output length = 1 (sampled token) + N (lookahead tokens)
+    2. Output length = 1 (sampled token) + N (lookahead tokens) + 1 (EOS)
        Note: The threshold check happens AFTER sampling, so output includes
-       the sampled token followed by the lookahead tokens.
-    3. The last N tokens in output ARE the lookahead tokens
+       the sampled token followed by the lookahead tokens, then EOS.
+       EOS is automatically appended to lookahead tokens for threshold checking.
+    3. The lookahead tokens appear after the sampled token, before EOS
     4. Works with random tokens sampled uniformly from vocabulary
     """
     import random
@@ -835,8 +838,10 @@ def test_low_threshold_always_triggers():
     print(f"\n  Running {len(prompts)} prompts with threshold={VERY_LOW_THRESHOLD}...")
     outputs = llm.generate(prompts, sampling_params)
 
-    # Expected output length: 1 sampled token + N lookahead tokens
-    expected_output_len = 1 + NUM_LOOKAHEAD_TOKENS
+    # Expected output length: 1 sampled token + N lookahead tokens + 1 EOS
+    # EOS is automatically appended to lookahead tokens for threshold checking
+    eos_token_id = tokenizer.eos_token_id
+    expected_output_len = 1 + NUM_LOOKAHEAD_TOKENS + 1  # +1 for EOS
 
     # Verify results
     all_passed = True
@@ -847,8 +852,10 @@ def test_low_threshold_always_triggers():
 
         triggered = (finish_reason == "lookahead")
         correct_length = (num_output_tokens == expected_output_len)
-        # Check that last N tokens are the lookahead tokens
-        correct_lookahead_tokens = (output_token_ids[-NUM_LOOKAHEAD_TOKENS:] == lookahead_ids)
+        # Check that lookahead tokens are at positions [1:N+1] (after sampled, before EOS)
+        correct_lookahead_tokens = (output_token_ids[1:1+NUM_LOOKAHEAD_TOKENS] == lookahead_ids)
+        # Check that EOS is the last token
+        correct_eos = (output_token_ids[-1] == eos_token_id)
 
         # Check if triggered
         if not triggered:
@@ -861,25 +868,34 @@ def test_low_threshold_always_triggers():
         # Check output length
         if not correct_length:
             print(f"\n  FAIL: Prompt {i} - wrong output length")
-            print(f"    Expected: {expected_output_len} tokens (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead)")
+            print(f"    Expected: {expected_output_len} tokens (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
             print(f"    Got: {num_output_tokens} tokens")
             print(f"    Token IDs: {output_token_ids}")
             all_passed = False
             continue
 
-        # Check lookahead tokens are at end of output
+        # Check lookahead tokens are in correct position
         if not correct_lookahead_tokens:
-            print(f"\n  FAIL: Prompt {i} - lookahead tokens not in output")
-            print(f"    Expected last {NUM_LOOKAHEAD_TOKENS} tokens: {lookahead_ids}")
-            print(f"    Got: {output_token_ids[-NUM_LOOKAHEAD_TOKENS:]}")
+            print(f"\n  FAIL: Prompt {i} - lookahead tokens not in correct position")
+            print(f"    Expected tokens[1:{1+NUM_LOOKAHEAD_TOKENS}]: {lookahead_ids}")
+            print(f"    Got: {output_token_ids[1:1+NUM_LOOKAHEAD_TOKENS]}")
+            all_passed = False
+            continue
+
+        # Check EOS is at end
+        if not correct_eos:
+            print(f"\n  FAIL: Prompt {i} - EOS not at end")
+            print(f"    Expected last token: {eos_token_id}")
+            print(f"    Got: {output_token_ids[-1]}")
             all_passed = False
             continue
 
         print(f"\n  PASS: Prompt {i}")
         print(f"    Triggered: YES")
-        print(f"    Output tokens: {num_output_tokens} (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead)")
+        print(f"    Output tokens: {num_output_tokens} (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
         print(f"    Sampled token: {output_token_ids[0]} -> '{tokenizer.decode([output_token_ids[0]])}'")
         print(f"    Lookahead tokens verified: {lookahead_ids}")
+        print(f"    EOS token verified: {eos_token_id}")
 
     if all_passed:
         print("\n" + "=" * 70)

@@ -440,6 +440,8 @@ class Processor:
                     )
                 else:
                     lookahead_token_ids = list(lookahead_tokens)
+                # Append EOS token so its probability is included in threshold check
+                lookahead_token_ids.append(eos_token_id)
 
         return decoder_inputs.get("prompt"), EngineCoreRequest(
             request_id=request_id,
