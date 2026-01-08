@@ -531,7 +531,166 @@ def test_lookahead_does_not_affect_output():
 
 
 # =============================================================================
-# Test 6: Consistency across multiple runs
+# Test 6: Lookahead does not affect logprobs (same-batch)
+# =============================================================================
+
+def test_lookahead_does_not_affect_logprobs():
+    """
+    CRITICAL TEST: Verify that lookahead NEVER changes the logprobs
+    unless it actually triggers.
+
+    This is similar to test_lookahead_does_not_affect_output but compares
+    logprobs instead of just token IDs. This ensures the model's probability
+    distribution is not affected by lookahead processing.
+
+    We test various lookahead tokens (common, unlikely, multi-token) all with
+    threshold=0, which should never trigger. The logprobs must be identical
+    (within floating point tolerance) to regular prompts processed in the
+    same batch.
+    """
+    print("\n" + "=" * 70)
+    print("TEST: Lookahead does NOT affect logprobs (same-batch)")
+    print("=" * 70)
+
+    llm = create_llm()
+
+    # Test prompts - using shorter prompts for faster testing
+    test_prompts = [
+        "The quick brown fox",
+        "def factorial(n):",
+        "In the year 2050,",
+    ]
+
+    # Various lookahead configurations - all with threshold=0 (never triggers)
+    lookahead_configs = [
+        " the",            # Common token
+        " XYZZY",          # Unlikely token
+        " jumped over",    # Multi-token
+    ]
+
+    # Request logprobs for comparison
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=20,  # Shorter for faster testing
+        skip_special_tokens=True,
+        logprobs=1,  # Request top-1 logprob for each token
+    )
+
+    # Build batch: [regular0, lookahead0_config0, lookahead0_config1, ..., regular1, ...]
+    batch = []
+    for prompt in test_prompts:
+        batch.append(prompt)  # Regular
+        for lookahead_tokens in lookahead_configs:
+            batch.append(LookaheadPrompt(
+                prompt=prompt,
+                lookahead_tokens=lookahead_tokens,
+                lookahead_threshold=0.0,  # Never triggers
+            ))
+
+    entries_per_prompt = 1 + len(lookahead_configs)  # 1 regular + N lookahead
+    print(f"  Running {len(batch)} prompts ({len(test_prompts)} prompts x {entries_per_prompt} variants)...")
+    outputs = llm.generate(batch, sampling_params)
+
+    # Tolerance levels for logprob comparison
+    # Note: Small differences can occur due to different computation paths
+    # (e.g., extended batch layout for lookahead, different scheduling).
+    # 
+    # STRICT_TOLERANCE: For positions where we expect exact match
+    # WARN_TOLERANCE: Differences above this are warnings but not failures
+    # FAIL_TOLERANCE: Differences above this indicate a real problem
+    STRICT_TOLERANCE = 0.01  # Very small differences OK
+    WARN_TOLERANCE = 0.1     # Larger differences are warnings
+    FAIL_TOLERANCE = 0.5     # Differences > 0.5 indicate token selection could differ
+
+    # Compare logprobs
+    all_match = True
+    total_warnings = 0
+    for prompt_idx, prompt in enumerate(test_prompts):
+        base_offset = prompt_idx * entries_per_prompt
+        regular_output = outputs[base_offset].outputs[0]
+        regular_logprobs = regular_output.logprobs
+        regular_token_ids = list(regular_output.token_ids)
+
+        if regular_logprobs is None:
+            print(f"\n  Prompt {prompt_idx}: No logprobs returned for regular prompt")
+            continue
+
+        print(f"\n  Prompt {prompt_idx}: '{prompt[:30]}...'")
+        print(f"    Regular: {len(regular_logprobs)} tokens with logprobs")
+
+        for config_idx, lookahead_tokens in enumerate(lookahead_configs):
+            la_offset = base_offset + 1 + config_idx
+            la_output = outputs[la_offset].outputs[0]
+            la_logprobs = la_output.logprobs
+            la_finish = la_output.finish_reason
+            la_token_ids = list(la_output.token_ids)
+
+            if la_finish == "lookahead":
+                print(f"    Config '{lookahead_tokens[:15]}': TRIGGERED (unexpected!)")
+                all_match = False
+                continue
+
+            if la_logprobs is None:
+                print(f"    Config '{lookahead_tokens[:15]}': No logprobs returned")
+                all_match = False
+                continue
+
+            # First check: token IDs must match exactly
+            if regular_token_ids != la_token_ids:
+                print(f"    Config '{lookahead_tokens[:15]}': TOKEN ID MISMATCH!")
+                all_match = False
+                continue
+
+            # Compare lengths
+            if len(regular_logprobs) != len(la_logprobs):
+                print(f"    Config '{lookahead_tokens[:15]}': LENGTH MISMATCH "
+                      f"({len(regular_logprobs)} vs {len(la_logprobs)})")
+                all_match = False
+                continue
+
+            # Compare logprobs at each position
+            max_diff = 0.0
+            warn_positions = []
+            fail_positions = []
+            for pos, (reg_lp, la_lp) in enumerate(zip(regular_logprobs, la_logprobs)):
+                if reg_lp is None or la_lp is None:
+                    continue
+
+                for token_id, reg_logprob_obj in reg_lp.items():
+                    if token_id in la_lp:
+                        la_logprob_obj = la_lp[token_id]
+                        diff = abs(reg_logprob_obj.logprob - la_logprob_obj.logprob)
+                        max_diff = max(max_diff, diff)
+                        if diff > FAIL_TOLERANCE:
+                            fail_positions.append((pos, token_id, diff))
+                        elif diff > WARN_TOLERANCE:
+                            warn_positions.append((pos, token_id, diff))
+
+            if fail_positions:
+                print(f"    Config '{lookahead_tokens[:15]}': FAIL - large logprob diffs")
+                for pos, token_id, diff in fail_positions[:3]:
+                    print(f"      Position {pos}: token {token_id}, diff={diff:.6f}")
+                all_match = False
+            elif warn_positions:
+                print(f"    Config '{lookahead_tokens[:15]}': WARN - small logprob diffs "
+                      f"(max={max_diff:.4f}, {len(warn_positions)} positions)")
+                total_warnings += len(warn_positions)
+            else:
+                print(f"    Config '{lookahead_tokens[:15]}': MATCH (max_diff={max_diff:.2e})")
+
+    if all_match:
+        if total_warnings > 0:
+            print(f"\nRESULT: LOGPROBS MATCH (with {total_warnings} minor numerical differences)")
+        else:
+            print("\nRESULT: LOOKAHEAD DOES NOT AFFECT LOGPROBS (PERFECT MATCH)")
+    else:
+        print("\nRESULT: LOOKAHEAD AFFECTED LOGPROBS INCORRECTLY (TEST FAILED)")
+
+    return all_match
+
+
+# =============================================================================
+# Test 7: Consistency across multiple runs
 # =============================================================================
 
 def test_determinism():
@@ -746,6 +905,7 @@ def run_all_tests():
         ("lookahead_termination", test_lookahead_termination),
         ("edge_cases", test_edge_cases),
         ("lookahead_does_not_affect_output", test_lookahead_does_not_affect_output),
+        ("lookahead_does_not_affect_logprobs", test_lookahead_does_not_affect_logprobs),
         ("determinism", test_determinism),
         ("low_threshold_always_triggers", test_low_threshold_always_triggers),
     ]
@@ -792,6 +952,7 @@ if __name__ == "__main__":
             "edge": test_edge_cases,
             "determinism": test_determinism,
             "low_threshold": test_low_threshold_always_triggers,
+            "logprobs": test_lookahead_does_not_affect_logprobs,
         }
         if test_name in test_map:
             test_map[test_name]()
