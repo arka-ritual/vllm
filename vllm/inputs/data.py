@@ -57,7 +57,7 @@ class LookaheadPrompt(TypedDict):
     prompt: str
     """The input text to be tokenized before passing to the model."""
 
-    lookahead_tokens: str | list[int]
+    lookahead_tokens: Union[str, list[int]]
     """
     The lookahead tokens to probe. Can be a string (which will be tokenized)
     or a list of token IDs.
@@ -70,13 +70,13 @@ class LookaheadPrompt(TypedDict):
     Typical values are negative (e.g., -3.0). More negative = stricter.
     """
 
-    multi_modal_data: NotRequired[MultiModalDataDict | None]
+    multi_modal_data: NotRequired["MultiModalDataDict"]
     """
     Optional multi-modal data to pass to the model,
     if the model supports it.
     """
 
-    mm_processor_kwargs: NotRequired[dict[str, Any] | None]
+    mm_processor_kwargs: NotRequired[dict[str, Any]]
     """
     Optional multi-modal processor kwargs to be forwarded to the
     multimodal input mapper & processor.
