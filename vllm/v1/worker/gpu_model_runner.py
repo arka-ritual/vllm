@@ -997,7 +997,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get the number of scheduled tokens for each request.
-        req_ids = self.input_batch.req_ids
+        # NOTE: Only use num_reqs requests - the rest may not be scheduled yet
+        req_ids = self.input_batch.req_ids[:num_reqs]
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
@@ -1014,6 +1015,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_tokens_extended = num_scheduled_tokens + num_lookahead_input_tokens
         total_num_tokens_extended = (total_num_scheduled_tokens +
                                      total_lookahead_extra)
+
+        # Safety check: if extended tokens would exceed buffer, skip lookahead
+        if total_num_tokens_extended > self.max_num_tokens:
+            # Fall back to non-lookahead mode to avoid buffer overflow
+            num_lookahead_input_tokens = np.zeros(num_reqs, dtype=np.int32)
+            total_lookahead_extra = 0
+            active_lookahead = {}
+            num_tokens_extended = num_scheduled_tokens
+            total_num_tokens_extended = total_num_scheduled_tokens
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1083,6 +1093,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Now build the extended input_ids and positions with interleaved
             extended_offset = 0
             scheduled_offset = 0
+            
+            
             for req_idx, req_id in enumerate(
                     self.input_batch.req_ids[:num_reqs]):
                 num_sched = int(num_scheduled_tokens[req_idx])
