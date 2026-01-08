@@ -48,20 +48,23 @@ def create_llm() -> LLM:
 
 def test_threshold_zero_matches_baseline():
     """
-    Test that lookahead with threshold=0 produces identical output to regular.
+    Test that lookahead with threshold>=0 is skipped entirely.
 
-    With threshold=0, lookahead should NEVER trigger because:
+    With threshold>=0, lookahead should be COMPLETELY SKIPPED because:
     - Log probabilities are always <= 0
     - Sum of logprobs is always <= 0
-    - Threshold check: sum > threshold (0) will never be true
+    - Threshold check: sum > threshold (>=0) will never be true
 
-    Therefore, generation should proceed exactly as without lookahead.
-
-    NOTE: We compare regular vs lookahead in the SAME BATCH to avoid
-    non-determinism from the async scheduler between separate generate() calls.
+    Therefore, lookahead prompts should:
+    1. NOT trigger (finish_reason != "lookahead")
+    2. Generate the full max_tokens
+    3. Produce identical output to running the same prompts separately
+    
+    NOTE: We run each prompt pair [regular, lookahead] in separate batches of 2
+    to ensure deterministic comparison (batch position affects output).
     """
     print("\n" + "=" * 70)
-    print("TEST: Threshold 0 matches regular (same-batch comparison)")
+    print("TEST: Threshold 0 skips lookahead (paired-batch comparison)")
     print("=" * 70)
 
     llm = create_llm()
@@ -84,56 +87,57 @@ def test_threshold_zero_matches_baseline():
         " ZZZZZ",               # Very unlikely
     ]
 
-    # Build mixed batch: [regular0, lookahead0, regular1, lookahead1, ...]
-    batch = []
-    for i, prompt in enumerate(test_prompts):
-        batch.append(prompt)  # Regular
-        batch.append(LookaheadPrompt(
-            prompt=prompt,
-            lookahead_tokens=lookahead_tokens_list[i % len(lookahead_tokens_list)],
-            lookahead_threshold=0.0,  # Will never trigger (logprobs are negative)
-        ))
-
     sampling_params = SamplingParams(
         temperature=0.0,  # Greedy decoding for determinism
         max_tokens=100,
         skip_special_tokens=True,
     )
 
-    print(f"Running {len(batch)} prompts ({len(test_prompts)} regular + {len(test_prompts)} lookahead)...")
-    outputs = llm.generate(batch, sampling_params)
-
-    # Compare regular vs lookahead outputs
-    all_match = True
+    # Run each prompt pair in its own batch of 2 for deterministic comparison
+    all_pass = True
     for i, prompt in enumerate(test_prompts):
-        regular_idx = i * 2
-        lookahead_idx = i * 2 + 1
-
-        regular_ids = list(outputs[regular_idx].outputs[0].token_ids)
-        lookahead_ids = list(outputs[lookahead_idx].outputs[0].token_ids)
-        finish_reason = outputs[lookahead_idx].outputs[0].finish_reason
+        batch = [
+            prompt,  # Regular at position 0
+            LookaheadPrompt(
+                prompt=prompt,
+                lookahead_tokens=lookahead_tokens_list[i % len(lookahead_tokens_list)],
+                lookahead_threshold=0.0,  # Will never trigger (logprobs are negative)
+            ),  # Lookahead at position 1
+        ]
+        
+        outputs = llm.generate(batch, sampling_params)
+        
+        regular_ids = list(outputs[0].outputs[0].token_ids)
+        lookahead_ids = list(outputs[1].outputs[0].token_ids)
+        lookahead_finish = outputs[1].outputs[0].finish_reason
 
         # Check that lookahead didn't trigger
-        if finish_reason == "lookahead":
+        if lookahead_finish == "lookahead":
             print(f"  FAIL: Prompt {i} - lookahead triggered with threshold=0!")
-            all_match = False
+            all_pass = False
+            continue
+
+        # Check both produced full output (not early termination)
+        if len(lookahead_ids) < 100:
+            print(f"  FAIL: Prompt {i} - lookahead produced only {len(lookahead_ids)} tokens")
+            all_pass = False
             continue
 
         # Check token IDs match exactly
         if regular_ids != lookahead_ids:
             print(f"  FAIL: Prompt {i} - token mismatch")
-            print(f"    Regular ({len(regular_ids)} tokens): {outputs[regular_idx].outputs[0].text[:50]}...")
-            print(f"    Lookahead ({len(lookahead_ids)} tokens): {outputs[lookahead_idx].outputs[0].text[:50]}...")
-            all_match = False
+            print(f"    Regular ({len(regular_ids)} tokens): {outputs[0].outputs[0].text[:50]}...")
+            print(f"    Lookahead ({len(lookahead_ids)} tokens): {outputs[1].outputs[0].text[:50]}...")
+            all_pass = False
         else:
             print(f"  PASS: Prompt {i} - {len(regular_ids)} tokens match")
 
-    if all_match:
+    if all_pass:
         print("\nRESULT: ALL PROMPTS MATCH REGULAR OUTPUT")
     else:
         print("\nRESULT: SOME PROMPTS DIFFER")
 
-    return all_match
+    return all_pass
 
 
 # =============================================================================
@@ -765,11 +769,10 @@ def test_low_threshold_always_triggers():
 
     This verifies:
     1. All lookahead prompts trigger (finish_reason == "lookahead")
-    2. Output length = 1 (sampled token) + N (lookahead tokens) + 1 (EOS)
-       Note: The threshold check happens AFTER sampling, so output includes
-       the sampled token followed by the lookahead tokens, then EOS.
+    2. Output length = N (lookahead tokens) + 1 (EOS)
+       When lookahead triggers, the output is ONLY the lookahead tokens (no sampled token).
        EOS is automatically appended to lookahead tokens for threshold checking.
-    3. The lookahead tokens appear after the sampled token, before EOS
+    3. The output is exactly the lookahead tokens followed by EOS
     4. Works with random tokens sampled uniformly from vocabulary
     """
     import random
@@ -838,10 +841,11 @@ def test_low_threshold_always_triggers():
     print(f"\n  Running {len(prompts)} prompts with threshold={VERY_LOW_THRESHOLD}...")
     outputs = llm.generate(prompts, sampling_params)
 
-    # Expected output length: 1 sampled token + N lookahead tokens + 1 EOS
+    # Expected output length: N lookahead tokens + 1 EOS (no sampled token)
+    # When lookahead triggers, output is ONLY the lookahead tokens
     # EOS is automatically appended to lookahead tokens for threshold checking
     eos_token_id = tokenizer.eos_token_id
-    expected_output_len = 1 + NUM_LOOKAHEAD_TOKENS + 1  # +1 for EOS
+    expected_output_len = NUM_LOOKAHEAD_TOKENS + 1  # lookahead + EOS
 
     # Verify results
     all_passed = True
@@ -852,8 +856,8 @@ def test_low_threshold_always_triggers():
 
         triggered = (finish_reason == "lookahead")
         correct_length = (num_output_tokens == expected_output_len)
-        # Check that lookahead tokens are at positions [1:N+1] (after sampled, before EOS)
-        correct_lookahead_tokens = (output_token_ids[1:1+NUM_LOOKAHEAD_TOKENS] == lookahead_ids)
+        # Check that lookahead tokens are at positions [0:N] (no sampled token before them)
+        correct_lookahead_tokens = (output_token_ids[:NUM_LOOKAHEAD_TOKENS] == lookahead_ids)
         # Check that EOS is the last token
         correct_eos = (output_token_ids[-1] == eos_token_id)
 
@@ -868,7 +872,7 @@ def test_low_threshold_always_triggers():
         # Check output length
         if not correct_length:
             print(f"\n  FAIL: Prompt {i} - wrong output length")
-            print(f"    Expected: {expected_output_len} tokens (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
+            print(f"    Expected: {expected_output_len} tokens ({NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
             print(f"    Got: {num_output_tokens} tokens")
             print(f"    Token IDs: {output_token_ids}")
             all_passed = False
@@ -877,8 +881,8 @@ def test_low_threshold_always_triggers():
         # Check lookahead tokens are in correct position
         if not correct_lookahead_tokens:
             print(f"\n  FAIL: Prompt {i} - lookahead tokens not in correct position")
-            print(f"    Expected tokens[1:{1+NUM_LOOKAHEAD_TOKENS}]: {lookahead_ids}")
-            print(f"    Got: {output_token_ids[1:1+NUM_LOOKAHEAD_TOKENS]}")
+            print(f"    Expected tokens[0:{NUM_LOOKAHEAD_TOKENS}]: {lookahead_ids}")
+            print(f"    Got: {output_token_ids[:NUM_LOOKAHEAD_TOKENS]}")
             all_passed = False
             continue
 
@@ -892,8 +896,7 @@ def test_low_threshold_always_triggers():
 
         print(f"\n  PASS: Prompt {i}")
         print(f"    Triggered: YES")
-        print(f"    Output tokens: {num_output_tokens} (1 sampled + {NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
-        print(f"    Sampled token: {output_token_ids[0]} -> '{tokenizer.decode([output_token_ids[0]])}'")
+        print(f"    Output tokens: {num_output_tokens} ({NUM_LOOKAHEAD_TOKENS} lookahead + 1 EOS)")
         print(f"    Lookahead tokens verified: {lookahead_ids}")
         print(f"    EOS token verified: {eos_token_id}")
 

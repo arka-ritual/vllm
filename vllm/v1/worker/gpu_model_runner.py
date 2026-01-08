@@ -2207,14 +2207,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             lookahead_tokens, threshold = self.input_batch.lookahead_config[
                 req_id]
 
-            # Only apply during decode phase (not prefill)
-            num_computed = self.input_batch.num_computed_tokens_cpu[req_idx]
-            num_prompt = self.input_batch.num_prompt_tokens[req_idx]
-            if num_computed < num_prompt:
+            # Skip if threshold >= 0 (can never trigger since logprobs are always <= 0)
+            if threshold >= 0:
                 continue
 
-            # Only apply when we're scheduling exactly 1 token (normal decode)
-            if num_scheduled_tokens[req_idx] != 1:
+            # Only apply when this step will produce a sample
+            # (i.e., we've processed enough tokens to complete prefill)
+            num_computed = self.input_batch.num_computed_tokens_cpu[req_idx]
+            num_prompt = self.input_batch.num_prompt_tokens[req_idx]
+            num_scheduled = num_scheduled_tokens[req_idx]
+            tokens_after_step = num_computed + num_scheduled
+            
+            # Skip if we won't complete prefill in this step
+            if tokens_after_step < num_prompt:
+                continue
+            
+            # Skip chunked prefill with multiple tokens (complex case)
+            # Only handle: end of prefill (num_scheduled > 1) or normal decode (num_scheduled == 1)
+            if num_scheduled > 1 and num_computed > 0:
+                # This is chunked prefill in the middle, skip
                 continue
 
             num_lookahead = len(lookahead_tokens)
@@ -2368,6 +2379,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 req_idx = self.input_batch.req_id_to_index.get(req_id)
                 if req_idx is not None and req_idx < len(valid_sampled_token_ids
                                                          ):
+                    # Undo the sampled token that was written in _bookkeeping_sync
+                    num_sampled = len(valid_sampled_token_ids[req_idx])
+                    if num_sampled > 0:
+                        # Remove from output_token_ids
+                        req_state = self.requests.get(req_id)
+                        if req_state is not None:
+                            req_state.output_token_ids = req_state.output_token_ids[:-num_sampled]
+                        # Reset token counts
+                        self.input_batch.num_tokens_no_spec[req_idx] -= num_sampled
+                        self.input_batch.num_tokens[req_idx] -= num_sampled
                     valid_sampled_token_ids[req_idx] = []
 
         return lookahead_terminated
