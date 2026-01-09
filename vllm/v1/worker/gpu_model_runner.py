@@ -2384,6 +2384,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_logprob = token_logprobs.sum().item()
 
             if total_logprob > threshold:
+                print(f"Terminating request {req_id} with total logprob {total_logprob} and threshold {threshold}")
+                print(f"Token IDs: {token_ids}")
+                print(f"Token logprobs: {token_logprobs}")
+                print()
+                
                 # Terminate and use lookahead tokens as output
                 lookahead_terminated[req_id] = token_ids
 
