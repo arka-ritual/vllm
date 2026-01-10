@@ -530,6 +530,15 @@ class OutputProcessor:
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
+
+                # For lookahead termination, clear existing output tokens
+                # before appending the lookahead tokens. This is needed because
+                # with async scheduling, prefill may have already generated a
+                # token before the decode step where lookahead triggered.
+                if finish_reason == FinishReason.LOOKAHEAD:
+                    req_state.detokenizer.token_ids.clear()
+                    req_state.detokenizer.output_text = ""
+
                 # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP

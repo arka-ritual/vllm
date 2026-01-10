@@ -1153,6 +1153,18 @@ class Scheduler(SchedulerInterface):
             if req_id in lookahead_terminated:
                 # Use lookahead tokens instead of sampled tokens
                 new_token_ids = lookahead_terminated[req_id]
+
+                # When lookahead triggers, we need to replace any existing output
+                # tokens that were sampled during prefill. With async scheduling,
+                # prefill may have already added a token before we process this
+                # decode step's output where lookahead actually triggered.
+                # Clear existing output and replace with just the lookahead tokens.
+                if request._output_token_ids:
+                    request._output_token_ids.clear()
+                    # Also clear from _all_token_ids (keep prompt tokens only)
+                    prompt_len = request.num_prompt_tokens
+                    del request._all_token_ids[prompt_len:]
+
                 request.append_output_token_ids(new_token_ids)
                 request.status = RequestStatus.FINISHED_LOOKAHEAD
                 stopped = True

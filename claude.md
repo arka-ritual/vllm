@@ -723,3 +723,192 @@ The remaining 52.8% overhead is expected because:
 1. **Enable FULL CUDA Graphs for Lookahead**: Currently using PIECEWISE mode; FULL mode would be faster but requires uniform decode
 2. **Dynamic Lookahead Reduction**: If context already ends with lookahead prefix, only probe remaining suffix
 3. **Streaming Support**: Ensure lookahead works correctly with streaming output
+
+---
+
+## CRITICAL BUG: Multi-Token Lookahead Logprobs Are Wrong (Jan 9, 2026)
+
+### ⚠️ IMPORTANT: TEST FILE IS CANONICAL - DO NOT MODIFY ⚠️
+
+**The test file `tests/lookahead/test_longer_lookahead.py` is 100% VALID and CORRECT.**
+
+**Under NO CIRCUMSTANCES WHATSOEVER may this test file be modified.**
+
+The implementation MUST pass this test. If the test fails, the implementation is wrong.
+
+---
+
+### Verified Expected Values (from test_logprobs.py)
+
+For the prompt `"The capitals of France and Spain respectively are:"` with lookahead `" Paris and Madrid."`:
+
+| Token | Position | Logprob |
+|-------|----------|---------|
+| ' Paris' | 8 | -6.405 |
+| ' and' | 9 | -0.032 |
+| ' Madrid' | 10 | -0.073 |
+| '.' | 11 | -0.170 |
+| **SUM** | | **-6.68** |
+
+The test's expected value of **-6.67987** is EXACTLY CORRECT.
+
+---
+
+### The Bug
+
+The current implementation returns **-20.36** instead of **-6.68**.
+
+Individual token logprobs from implementation:
+| Token | Expected | Actual | Status |
+|-------|----------|--------|--------|
+| ' Paris' | -3.38* | -3.38 | ✓ CORRECT |
+| ' and' | -0.032 | -5.96 | ✗ WRONG |
+| ' Madrid' | -0.073 | -8.19 | ✗ WRONG |
+| '.' | -0.170 | -2.83 | ✗ WRONG |
+
+*Note: -3.38 is P(' Paris' | "...are:"), while -6.405 is from a different measurement context.
+
+**Key Observation**: The FIRST token is correct, but ALL SUBSEQUENT tokens are wrong.
+
+---
+
+### Suspected Root Cause
+
+The implementation may be computing:
+- `P(lookahead | context + sampled_token)` ← WRONG
+
+Instead of:
+- `P(lookahead | context)` ← CORRECT
+
+**Evidence**:
+1. First lookahead token (' Paris') has CORRECT logprob (-3.38)
+2. Second lookahead token (' and') has WRONG logprob (-5.96 instead of -0.032)
+
+This suggests that when computing logprobs for ' and', the model is NOT seeing ' Paris' in the context. Instead, it may be seeing the SAMPLED token (e.g., ' France' which the model naturally generates).
+
+If the attention for lookahead positions is not properly attending to the LOOKAHEAD tokens we appended, but instead attending to whatever got sampled, that would explain the wrong logprobs.
+
+---
+
+### What Needs To Be Fixed
+
+The lookahead logprob computation must ensure that:
+1. Lookahead tokens ARE in the input sequence at positions [P, P+1, ..., P+K-2]
+2. The attention mechanism DOES attend to these lookahead tokens
+3. The logprob for lookahead[i] is computed conditioned on context + lookahead[0:i], NOT context + sampled_tokens
+
+The slot_mapping for lookahead uses -1 (PAD_SLOT_ID) to prevent KV cache writes, but this should NOT affect attention computation during prefill since attention uses the raw Q/K/V tensors, not cached values.
+
+---
+
+### Files with Debug Logging
+
+Debug output can be enabled with `DEBUG_LOOKAHEAD=1`:
+- `_calculate_lookahead_extension()` - logs prefill/decode state
+- `_prepare_inputs()` - logs input_ids and positions
+- `_prepare_lookahead_metadata()` - logs logits indices
+- `_check_lookahead_termination()` - logs computed logprobs
+
+---
+
+### Test Commands
+
+```bash
+# Run the canonical test (MUST PASS)
+python tests/lookahead/test_longer_lookahead.py
+
+# Run with debug output
+DEBUG_LOOKAHEAD=1 python tests/lookahead/test_longer_lookahead.py
+
+# Verify expected logprob values
+python test_logprobs.py
+```
+
+---
+
+## BUG FIX: Multi-Token Lookahead Now Works (Jan 10, 2026)
+
+### Root Cause Identified
+
+The bug was in how slot_mapping was computed for lookahead tokens.
+
+**The Problem**: Lookahead tokens had `slot_mapping=-1` (PAD_SLOT_ID), which correctly prevented them from writing to the KV cache. HOWEVER, this also meant they were **NOT** written to the KV cache during the forward pass, so the attention mechanism couldn't see them!
+
+In vLLM's FlashAttention implementation:
+```python
+# reshape_and_cache_flash() writes K/V to cache based on slot_mapping
+# Then flash_attn_varlen_func() reads from key_cache/value_cache
+flash_attn_varlen_func(
+    q=query[:num_actual_tokens],
+    k=key_cache,  # <-- Reads from KV CACHE, not current keys!
+    v=value_cache,  # <-- Reads from KV CACHE, not current values!
+    ...
+)
+```
+
+With `slot_mapping=-1`, lookahead tokens were skipped during `reshape_and_cache_flash()`, so they never appeared in `key_cache`/`value_cache`. This meant:
+- Position 7 (last prompt token): saw positions 0-7 from KV cache ✓
+- Position 8 (first lookahead): should see 0-8, but only 0-7 were in KV cache ✗
+- Position 9: should see 0-9, but only 0-7 were in KV cache ✗
+- Position 10: should see 0-10, but only 0-7 were in KV cache ✗
+
+### The Fix
+
+Changed the slot_mapping computation to give lookahead tokens **valid** KV cache slots, so they get written to the cache and can be attended to.
+
+**In `_prepare_inputs()` (lines 1684-1697):**
+
+```python
+# BEFORE (broken):
+# Build extended slot_mapping with -1 for lookahead positions
+extended_slot_mapping = np.full(total_num_tokens_extended, -1, dtype=np.int64)
+# Copy scheduled slot mappings only...
+# Lookahead positions remain -1 (PAD_SLOT_ID) - don't write to KV cache
+
+# AFTER (fixed):
+# Compute slot mapping for ALL tokens including lookahead
+# Lookahead tokens MUST be in KV cache for attention to see them
+if total_lookahead_extra > 0:
+    extended_req_indices = np.repeat(self.arange_np[:num_reqs], num_tokens_extended)
+    self.input_batch.block_table.compute_slot_mapping(
+        extended_req_indices, positions_np[:total_num_tokens_extended]
+    )
+    self.input_batch.block_table.commit_slot_mapping(total_num_tokens_extended)
+```
+
+### Test Results After Fix
+
+```
+======================================================================
+PART 1: Thresholds BELOW exact (should trigger)
+======================================================================
+--- Paris/Madrid (threshold=-7.0, exact=-6.67987) ---
+  finish_reason: lookahead
+  Output: ' Paris and Madrid.'
+  PASS: Triggered as expected (threshold below exact)
+
+======================================================================
+PART 2: Thresholds ABOVE exact (should NOT trigger)
+======================================================================
+--- Paris/Madrid (threshold=-6.0, exact=-6.67987) ---
+  finish_reason: length
+  Output: ':
+A)  Paris and Madrid
+B)  Paris and Barcelona...'
+  PASS: Did NOT trigger as expected (threshold above exact)
+
+======================================================================
+RESULT: ALL TESTS PASSED
+======================================================================
+```
+
+### Implications for KV Cache Management
+
+With this fix, lookahead tokens ARE written to the KV cache. This means:
+
+1. **If lookahead triggers**: The KV cache already contains the lookahead tokens ✓
+2. **If lookahead doesn't trigger**: The KV cache contains lookahead tokens that should be "forgotten"
+
+For case 2, the scheduler handles this by not incrementing `num_computed_tokens` for lookahead tokens. On subsequent decode iterations, the model will overwrite those KV cache positions with actual generated tokens.
+
+---

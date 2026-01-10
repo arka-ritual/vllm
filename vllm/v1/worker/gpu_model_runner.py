@@ -303,6 +303,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
+
+        # Clear sampled tokens for requests where lookahead terminated.
+        # In async scheduling, the clearing in _check_lookahead_termination
+        # happens on an empty list, so we need to clear here when we have
+        # the actual sampled tokens.
+        if output.lookahead_terminated:
+            for req_id in output.lookahead_terminated:
+                req_idx = output.req_id_to_index.get(req_id)
+                if req_idx is not None and req_idx < len(valid_sampled_token_ids):
+                    valid_sampled_token_ids[req_idx] = []
+
         if self._logprobs_tensors_cpu:
             output.logprobs = self._logprobs_tensors_cpu.tolists(cu_num_tokens)
         return output
@@ -1609,6 +1620,15 @@ class GPUModelRunner(
                         positions_np[extended_offset + num_sched + i] = \
                             last_scheduled_pos + 1 + i
 
+                    import os
+                    if os.environ.get("DEBUG_LOOKAHEAD"):
+                        print(f"[DEBUG] _prepare_inputs: req_id={req_id}, extended_offset={extended_offset}, "
+                              f"num_sched={num_sched}, num_extra={num_extra}")
+                        print(f"[DEBUG]   input_ids[{extended_offset}:{extended_offset+num_sched+num_extra}] = "
+                              f"{self.input_ids.cpu[extended_offset:extended_offset+num_sched+num_extra].tolist()}")
+                        print(f"[DEBUG]   positions[{extended_offset}:{extended_offset+num_sched+num_extra}] = "
+                              f"{positions_np[extended_offset:extended_offset+num_sched+num_extra].tolist()}")
+
                 extended_offset += num_sched + num_extra
                 scheduled_offset += num_sched
 
@@ -1661,51 +1681,18 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        # Compute slot mapping for scheduled tokens only (not lookahead)
-        # Lookahead tokens should NOT write to KV cache - use -1 (PAD_SLOT_ID)
+        # Compute slot mapping for ALL tokens including lookahead
+        # Lookahead tokens MUST be in KV cache for attention to see them
         if total_lookahead_extra > 0:
-            # First compute slot_mapping for scheduled tokens using ORIGINAL positions
-            # (not the extended ones that include lookahead)
-            # scheduled_positions was saved earlier before lookahead positions were added
-            self.input_batch.block_table.compute_slot_mapping(
-                req_indices, scheduled_positions
+            # Build extended req_indices for ALL tokens (scheduled + lookahead)
+            extended_req_indices = np.repeat(
+                self.arange_np[:num_reqs], num_tokens_extended
             )
 
-            # Now we need to interleave the slot_mapping for extended layout
-            # Handle all KV cache groups
-            num_kv_groups = len(self.input_batch.block_table.block_tables)
-            for gid in range(num_kv_groups):
-                block_table = self.input_batch.block_table[gid]
-
-                # Get the computed slot_mapping for scheduled tokens
-                scheduled_slot_mapping = block_table.slot_mapping.np[
-                    :total_num_scheduled_tokens
-                ].copy()
-
-                # Build extended slot_mapping with -1 for lookahead positions
-                extended_slot_mapping = np.full(
-                    total_num_tokens_extended, -1, dtype=np.int64
-                )
-
-                # Copy scheduled token slot_mapping to correct interleaved positions
-                scheduled_offset = 0
-                extended_offset = 0
-                for req_idx in range(num_reqs):
-                    num_sched = int(num_scheduled_tokens[req_idx])
-                    num_extra = int(num_lookahead_input_tokens[req_idx])
-
-                    # Copy scheduled slot mappings
-                    extended_slot_mapping[extended_offset:extended_offset + num_sched] = \
-                        scheduled_slot_mapping[scheduled_offset:scheduled_offset + num_sched]
-
-                    # Lookahead positions remain -1 (PAD_SLOT_ID) - don't write to KV cache
-
-                    extended_offset += num_sched + num_extra
-                    scheduled_offset += num_sched
-
-                # Write extended slot_mapping back
-                block_table.slot_mapping.np[:total_num_tokens_extended] = \
-                    extended_slot_mapping
+            # Compute slot_mapping for all tokens using extended positions
+            self.input_batch.block_table.compute_slot_mapping(
+                extended_req_indices, positions_np[:total_num_tokens_extended]
+            )
 
             self.input_batch.block_table.commit_slot_mapping(total_num_tokens_extended)
         else:
@@ -3214,23 +3201,44 @@ class GPUModelRunner(
 
             lookahead_tokens, threshold = self.input_batch.lookahead_config[req_id]
 
-            # Only apply during decode phase (not prefill)
+            # Check if this is prefill (processing prompt tokens) or decode
             num_computed = self.input_batch.num_computed_tokens_cpu[req_idx]
             num_prompt = self.input_batch.num_prompt_tokens[req_idx]
-            if num_computed < num_prompt:
-                continue
-
-            # Only apply when we're scheduling exactly 1 token (normal decode)
-            if num_scheduled_tokens[req_idx] != 1:
-                continue
+            is_prefill = num_computed < num_prompt
 
             num_lookahead = len(lookahead_tokens)
             if num_lookahead == 0:
                 continue
 
-            # For K lookahead tokens, we need K-1 extra input tokens
-            # (we feed lookahead[0:K-1] to get logits for lookahead[0:K])
-            num_lookahead_input_tokens[req_idx] = num_lookahead - 1
+            import os
+            if os.environ.get("DEBUG_LOOKAHEAD"):
+                print(f"[DEBUG] _calculate_lookahead_extension: req_id={req_id}, "
+                      f"num_computed={num_computed}, num_prompt={num_prompt}, "
+                      f"is_prefill={is_prefill}, num_lookahead={num_lookahead}, "
+                      f"num_scheduled={num_scheduled_tokens[req_idx]}")
+
+            if is_prefill:
+                # During prefill, we can check lookahead at the end of prompt
+                # Only apply on the LAST prefill chunk (when we finish the prompt)
+                tokens_after_this_step = num_computed + num_scheduled_tokens[req_idx]
+                if tokens_after_this_step < num_prompt:
+                    # Not the last prefill chunk, skip
+                    if os.environ.get("DEBUG_LOOKAHEAD"):
+                        print(f"[DEBUG]   -> Skipping: tokens_after_this_step={tokens_after_this_step} < num_prompt={num_prompt}")
+                    continue
+                # For K lookahead tokens at prefill, we need K-1 extra input tokens
+                # Note: This extends the KV cache, so if we don't trigger, subsequent
+                # decoding may be affected. But this gives correct logprobs.
+                num_lookahead_input_tokens[req_idx] = num_lookahead - 1
+                if os.environ.get("DEBUG_LOOKAHEAD"):
+                    print(f"[DEBUG]   -> ACTIVE at prefill: num_lookahead_input={num_lookahead - 1}")
+            else:
+                # During decode, skip lookahead checking
+                # The correct check happens at prefill time
+                if os.environ.get("DEBUG_LOOKAHEAD"):
+                    print(f"[DEBUG]   -> Skipping decode phase")
+                continue
+
             active_lookahead[req_id] = (lookahead_tokens, threshold)
 
         total_extra_tokens = int(num_lookahead_input_tokens.sum())
@@ -3299,6 +3307,14 @@ class GPUModelRunner(
                 lookahead_tokens,    # The actual token IDs
                 threshold,           # Threshold for acceptance
             )
+
+            import os
+            if os.environ.get("DEBUG_LOOKAHEAD"):
+                print(f"[DEBUG] _prepare_lookahead_metadata: req_id={req_id}, "
+                      f"end_pos={end_pos}, num_extra_input={num_extra_input}, "
+                      f"base_logits_idx={base_logits_idx}, num_lookahead={num_lookahead}")
+                print(f"[DEBUG]   logits indices: {[base_logits_idx + i for i in range(num_lookahead)]}")
+                print(f"[DEBUG]   lookahead_tokens: {lookahead_tokens}")
 
             # Add all K positions to logits_indices
             for i in range(num_lookahead):

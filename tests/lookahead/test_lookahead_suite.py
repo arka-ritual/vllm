@@ -124,6 +124,7 @@ def test_threshold_zero_matches_baseline():
             print(f"  FAIL: Prompt {i} - token mismatch")
             print(f"    Regular ({len(regular_ids)} tokens): {outputs[regular_idx].outputs[0].text[:50]}...")
             print(f"    Lookahead ({len(lookahead_ids)} tokens): {outputs[lookahead_idx].outputs[0].text[:50]}...")
+            import pdb; pdb.set_trace()
             all_match = False
         else:
             print(f"  PASS: Prompt {i} - {len(regular_ids)} tokens match")
@@ -230,7 +231,7 @@ def test_batched_generation_with_threshold():
 
         print(f"  {status}: Prompt {i} ({exp['type']})")
         print(f"       finish_reason={finish_reason}, tokens={num_tokens}")
-        print(f"       output: {text[:60]}...")
+        print(f"       output: {text[:60]}")
         if triggered != exp["should_trigger"]:
             print(f"       EXPECTED: should_trigger={exp['should_trigger']}")
 
@@ -345,10 +346,12 @@ def test_lookahead_termination():
     passed_count = sum(results)
     total_count = len(results)
     print(f"\nRESULT: {passed_count}/{total_count} tests passed")
-    print("NOTE: This test is informational - trigger thresholds are model-dependent")
 
-    # Always pass - this test is informational since thresholds are model-dependent
-    return True
+    if passed_count == total_count:
+        print("PASS: All tests passed")
+        return True
+    else:
+        return False
 
 
 # =============================================================================
@@ -433,8 +436,40 @@ def test_edge_cases():
     print(f"       Output: {outputs_4d[0].outputs[0].text}")
     print(f"       finish_reason: {outputs_4d[0].outputs[0].finish_reason}")
 
-    print("\n  All edge case subtests completed")
-    return True
+    # Validate results
+    print("\n  Validating edge case results...")
+    all_passed = True
+
+    # 4a: Single token lookahead should run without error and produce output
+    if len(outputs_4a) > 0 and outputs_4a[0].outputs[0].text:
+        print("  4a: PASS - Single token lookahead produced output")
+    else:
+        print("  4a: FAIL - Single token lookahead failed")
+        all_passed = False
+
+    # 4b: Long lookahead should run without error and produce output
+    if len(outputs_4b) > 0 and outputs_4b[0].outputs[0].text:
+        print("  4b: PASS - Long lookahead produced output")
+    else:
+        print("  4b: FAIL - Long lookahead failed")
+        all_passed = False
+
+    # 4c: Mixed prompts should all produce output
+    if len(outputs_4c) == 4:
+        print("  4c: PASS - Mixed prompts all produced output")
+    else:
+        print(f"  4c: FAIL - Expected 4 outputs, got {len(outputs_4c)}")
+        all_passed = False
+
+    # 4d: Token IDs lookahead should run without error
+    if len(outputs_4d) > 0 and outputs_4d[0].outputs[0].text:
+        print("  4d: PASS - Token IDs lookahead produced output")
+    else:
+        print("  4d: FAIL - Token IDs lookahead failed")
+        all_passed = False
+
+    print(f"\n  Edge cases: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
+    return all_passed
 
 
 # =============================================================================
@@ -594,6 +629,146 @@ def test_determinism():
 
 
 # =============================================================================
+# Test 7: Low threshold always triggers (even with random tokens)
+# =============================================================================
+
+def test_low_threshold_always_triggers():
+    """
+    Test that with a very low threshold (e.g., -10000), lookahead ALWAYS triggers,
+    even for completely random/unlikely tokens.
+
+    This verifies:
+    1. All lookahead prompts trigger (finish_reason == "lookahead")
+    2. Output length = 1 (sampled token) + N (lookahead tokens)
+       Note: The threshold check happens AFTER sampling, so output includes
+       the sampled token followed by the lookahead tokens.
+    3. The last N tokens in output ARE the lookahead tokens
+    4. Works with random tokens sampled uniformly from vocabulary
+    """
+    import random
+
+    print("\n" + "=" * 70)
+    print("TEST: Low threshold always triggers (random tokens)")
+    print("=" * 70)
+
+    llm = create_llm()
+    tokenizer = llm.get_tokenizer()
+
+    # Get vocabulary size for random sampling
+    vocab_size = tokenizer.vocab_size
+    print(f"  Vocabulary size: {vocab_size}")
+
+    # Set seed for reproducibility
+    random.seed(42)
+
+    # Test prompts
+    test_prompts = [
+        "The capital of France is",
+        "def fibonacci(n):",
+        "Once upon a time",
+        "The answer to life is",
+        "Machine learning involves",
+    ]
+
+    # Very low threshold - should ALWAYS trigger regardless of token likelihood
+    VERY_LOW_THRESHOLD = -10000.0
+
+    # Number of random lookahead tokens per prompt
+    NUM_LOOKAHEAD_TOKENS = 3
+
+    # Build prompts with random tokens
+    prompts = []
+    lookahead_token_ids_list = []
+
+    for prompt in test_prompts:
+        # Sample random token IDs from vocabulary (avoiding special tokens at start)
+        # Use range 1000 to vocab_size-1000 to avoid special tokens
+        safe_start = min(1000, vocab_size // 10)
+        safe_end = max(vocab_size - 1000, vocab_size * 9 // 10)
+        random_token_ids = [
+            random.randint(safe_start, safe_end)
+            for _ in range(NUM_LOOKAHEAD_TOKENS)
+        ]
+
+        prompts.append(LookaheadPrompt(
+            prompt=prompt,
+            lookahead_tokens=random_token_ids,
+            lookahead_threshold=VERY_LOW_THRESHOLD,
+        ))
+        lookahead_token_ids_list.append(random_token_ids)
+
+        # Decode tokens for display
+        decoded = tokenizer.decode(random_token_ids)
+        print(f"  Prompt: '{prompt[:30]}...'")
+        print(f"    Random tokens: {random_token_ids} -> '{decoded}'")
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=100,  # Should never reach this - trigger happens immediately
+        skip_special_tokens=False,  # Keep all tokens for accurate counting
+    )
+
+    print(f"\n  Running {len(prompts)} prompts with threshold={VERY_LOW_THRESHOLD}...")
+    outputs = llm.generate(prompts, sampling_params)
+
+    # Expected output: ONLY the lookahead tokens (sampled token is replaced)
+    expected_output_len = NUM_LOOKAHEAD_TOKENS
+
+    # Verify results
+    all_passed = True
+    for i, (output, lookahead_ids) in enumerate(zip(outputs, lookahead_token_ids_list)):
+        finish_reason = output.outputs[0].finish_reason
+        output_token_ids = list(output.outputs[0].token_ids)
+        num_output_tokens = len(output_token_ids)
+
+        triggered = (finish_reason == "lookahead")
+        correct_length = (num_output_tokens == expected_output_len)
+        # Output should be exactly the lookahead tokens
+        correct_lookahead_tokens = (output_token_ids == lookahead_ids)
+
+        # Check if triggered
+        if not triggered:
+            print(f"\n  FAIL: Prompt {i} - did NOT trigger (finish_reason={finish_reason})")
+            print(f"    Expected: lookahead trigger")
+            print(f"    Got: {num_output_tokens} tokens, finish_reason={finish_reason}")
+            all_passed = False
+            continue
+
+        # Check output length
+        if not correct_length:
+            print(f"\n  FAIL: Prompt {i} - wrong output length")
+            print(f"    Expected: {expected_output_len} lookahead tokens")
+            print(f"    Got: {num_output_tokens} tokens")
+            print(f"    Token IDs: {output_token_ids}")
+            all_passed = False
+            continue
+
+        # Check lookahead tokens match exactly
+        if not correct_lookahead_tokens:
+            print(f"\n  FAIL: Prompt {i} - lookahead tokens don't match")
+            print(f"    Expected: {lookahead_ids}")
+            print(f"    Got: {output_token_ids}")
+            all_passed = False
+            continue
+
+        print(f"\n  PASS: Prompt {i}")
+        print(f"    Triggered: YES")
+        print(f"    Output tokens: {num_output_tokens} (lookahead tokens only)")
+        print(f"    Lookahead tokens verified: {lookahead_ids}")
+
+    if all_passed:
+        print("\n" + "=" * 70)
+        print("RESULT: ALL PROMPTS TRIGGERED WITH CORRECT LENGTH")
+        print("=" * 70)
+    else:
+        print("\n" + "=" * 70)
+        print("RESULT: SOME PROMPTS FAILED")
+        print("=" * 70)
+
+    return all_passed
+
+
+# =============================================================================
 # Main test runner
 # =============================================================================
 
@@ -606,6 +781,7 @@ def run_all_tests():
         ("edge_cases", test_edge_cases),
         ("lookahead_does_not_affect_output", test_lookahead_does_not_affect_output),
         ("determinism", test_determinism),
+        ("low_threshold_always_triggers", test_low_threshold_always_triggers),
     ]
 
     print("=" * 70)
@@ -649,6 +825,7 @@ if __name__ == "__main__":
             "termination": test_lookahead_termination,
             "edge": test_edge_cases,
             "determinism": test_determinism,
+            "low_threshold": test_low_threshold_always_triggers,
         }
         if test_name in test_map:
             test_map[test_name]()
