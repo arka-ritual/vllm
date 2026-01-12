@@ -4,11 +4,13 @@
 import functools
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
+from dataclasses import dataclass
 from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
@@ -182,6 +184,58 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
+
+
+# Simple profiler for lookahead overhead analysis
+class _LookaheadProfiler:
+    """Accumulates timing stats for lookahead overhead analysis."""
+    enabled = os.environ.get("PROFILE_LOOKAHEAD", "0") == "1"
+    stats: dict[str, list[float]] = {}
+    iteration_count = 0
+
+    @classmethod
+    def reset(cls):
+        cls.stats = {}
+        cls.iteration_count = 0
+
+    @classmethod
+    def record(cls, name: str, elapsed_ms: float):
+        if not cls.enabled:
+            return
+        if name not in cls.stats:
+            cls.stats[name] = []
+        cls.stats[name].append(elapsed_ms)
+
+    @classmethod
+    def report(cls):
+        if not cls.enabled or not cls.stats:
+            return
+        print("\n" + "=" * 60)
+        print("LOOKAHEAD PROFILER REPORT")
+        print("=" * 60)
+        for name, times in sorted(cls.stats.items()):
+            avg = sum(times) / len(times)
+            total = sum(times)
+            print(f"{name}: avg={avg:.3f}ms, total={total:.1f}ms, count={len(times)}")
+        print("=" * 60)
+
+
+@dataclass
+class LookaheadMetadata:
+    """Metadata for lookahead token checking."""
+    # req_id -> (logits_start_idx, num_tokens, lookahead_token_ids, threshold)
+    request_info: dict[str, tuple[int, int, list[int], float]]
+    # Indices into the full logits tensor to extract lookahead logits
+    # Shape: [total_lookahead_positions]
+    logits_indices: torch.Tensor | None
+    # Total number of lookahead tokens across all requests
+    total_lookahead_tokens: int
+
+    @classmethod
+    def empty(cls) -> "LookaheadMetadata":
+        return cls(request_info={}, logits_indices=None, total_lookahead_tokens=0)
+
+
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
@@ -249,6 +303,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
+
+        # Clear sampled tokens for requests where lookahead terminated.
+        # In async scheduling, the clearing in _check_lookahead_termination
+        # happens on an empty list, so we need to clear here when we have
+        # the actual sampled tokens.
+        if output.lookahead_terminated:
+            for req_id in output.lookahead_terminated:
+                req_idx = output.req_id_to_index.get(req_id)
+                if req_idx is not None and req_idx < len(valid_sampled_token_ids):
+                    valid_sampled_token_ids[req_idx] = []
+
         if self._logprobs_tensors_cpu:
             output.logprobs = self._logprobs_tensors_cpu.tolists(cu_num_tokens)
         return output
@@ -309,6 +374,10 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    lookahead_metadata: "LookaheadMetadata | None" = None
+    # When lookahead is active, logits contains extended positions.
+    # sampling_logits contains only sampling positions for the sampler.
+    sampling_logits: torch.Tensor | None = None
 
 
 class GPUModelRunner(
@@ -881,6 +950,8 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                lookahead_token_ids=new_req_data.lookahead_token_ids,
+                lookahead_threshold=new_req_data.lookahead_threshold,
             )
             self.requests[req_id] = req_state
 
@@ -1299,6 +1370,77 @@ class GPUModelRunner(
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
 
+    def _prepare_input_ids_lookahead(
+        self,
+        scheduler_output: "SchedulerOutput",
+        total_num_tokens_extended: int,
+        cu_num_tokens_extended: np.ndarray,
+        num_tokens_extended: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        """Prepare input IDs for lookahead case with interleaved layout.
+
+        In the interleaved layout, decode tokens are at the START of each
+        request's range, not at the end. This function handles the copy
+        and scatter correctly for this layout.
+        """
+        # First, copy input_ids.cpu to GPU
+        self.input_ids.copy_to_gpu(total_num_tokens_extended)
+        if self.enable_prompt_embeds:
+            self.inputs_embeds.copy_to_gpu(total_num_tokens_extended)
+            self.is_token_ids.copy_to_gpu(total_num_tokens_extended)
+
+        # If no prev_sampled_token_ids, we're done
+        if self.input_batch.prev_sampled_token_ids is None:
+            return
+
+        # Scatter decode tokens from prev_sampled_token_ids to correct positions
+        # In interleaved layout, decode token for request i is at:
+        # - Position 0 if i == 0
+        # - Position cu_num_tokens_extended[i-1] otherwise
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if prev_req_id_to_index is None:
+            return
+
+        sample_flattened_indices: list[int] = []
+        prev_common_req_indices: list[int] = []
+
+        for req_id, cur_index in self.input_batch.req_id_to_index.items():
+            if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
+                prev_common_req_indices.append(prev_index)
+                # In interleaved layout, decode token is at the start of request's range
+                if cur_index == 0:
+                    flattened_index = 0
+                else:
+                    flattened_index = int(cu_num_tokens_extended[cur_index - 1])
+                sample_flattened_indices.append(flattened_index)
+
+        if not sample_flattened_indices:
+            return
+
+        # Scatter the decode tokens
+        sampled_tokens_index_tensor = torch.tensor(
+            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        prev_common_req_indices_tensor = torch.tensor(
+            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        ).to(self.device, non_blocking=True)
+        self.input_ids.gpu.scatter_(
+            dim=0,
+            index=sampled_tokens_index_tensor,
+            src=self.input_batch.prev_sampled_token_ids[
+                prev_common_req_indices_tensor, 0
+            ],
+        )
+
+        if self.enable_prompt_embeds:
+            # Mark scattered positions as token IDs, not embeddings
+            self.is_token_ids.gpu.scatter_(
+                dim=0,
+                index=sampled_tokens_index_tensor,
+                src=torch.ones_like(sampled_tokens_index_tensor, dtype=torch.bool),
+            )
+
     def _get_encoder_seq_lens(
         self,
         num_scheduled_tokens: dict[str, int],
@@ -1340,6 +1482,7 @@ class GPUModelRunner(
     ) -> tuple[
         torch.Tensor,
         SpecDecodeMetadata | None,
+        LookaheadMetadata,
     ]:
         """
         :return: tuple[
@@ -1351,11 +1494,23 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        # Calculate lookahead extension (extra tokens for lookahead checking)
+        # For K lookahead tokens, we add K-1 extra input tokens
+        (
+            num_lookahead_input_tokens,
+            total_lookahead_extra,
+            active_lookahead,
+        ) = self._calculate_lookahead_extension(num_reqs, num_scheduled_tokens)
+
+        # Extended token counts include lookahead input tokens
+        num_tokens_extended = num_scheduled_tokens + num_lookahead_input_tokens
+        total_num_tokens_extended = total_num_scheduled_tokens + total_lookahead_extra
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        # Get request indices.
+        # Get request indices for original scheduled tokens
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -1363,12 +1518,16 @@ class GPUModelRunner(
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
 
-        # Get positions.
-        positions_np = self.positions.np[:total_num_scheduled_tokens]
+        # Also compute extended cumsum for lookahead position tracking
+        cu_num_tokens_extended, _ = self._get_cumsum_and_arange(num_tokens_extended)
+
+
+        # Get positions for original scheduled tokens
+        positions_np = self.positions.np[:total_num_tokens_extended]
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
             arange,
-            out=positions_np,
+            out=positions_np[:total_num_scheduled_tokens],
         )
 
         # Calculate M-RoPE positions.
@@ -1381,32 +1540,106 @@ class GPUModelRunner(
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
-        # Get token indices.
+        # Get token indices for original scheduled tokens.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            positions_np[:total_num_scheduled_tokens]
+            + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
         token_indices_tensor = torch.from_numpy(token_indices)
 
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            token_indices_tensor,
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
-        )
-        if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+        if total_lookahead_extra == 0:
+            # No lookahead - use the fast path
+            # NOTE(woosuk): We use torch.index_select instead of np.take here
+            # because torch.index_select is much faster than np.take for large
+            # tensors.
             torch.index_select(
-                is_token_ids,
+                self.input_batch.token_ids_cpu_tensor.flatten(),
                 0,
                 token_indices_tensor,
-                out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                out=self.input_ids.cpu[:total_num_scheduled_tokens],
             )
+            if self.enable_prompt_embeds:
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                )
+        else:
+            # With lookahead, we need to interleave tokens correctly.
+            # The layout must match cu_num_tokens_extended:
+            # [req0_sched + req0_lookahead, req1_sched + req1_lookahead, ...]
+            #
+            # First, get all scheduled tokens into a temporary tensor
+            scheduled_tokens = torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                token_indices_tensor,
+            )
+
+            # Also save the original scheduled positions (they're at [0:total_num_scheduled])
+            scheduled_positions = positions_np[:total_num_scheduled_tokens].copy()
+
+            # Now build the extended input_ids and positions with correct interleaved layout
+            extended_offset = 0
+            scheduled_offset = 0
+            for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                num_sched = int(num_scheduled_tokens[req_idx])
+                num_extra = int(num_lookahead_input_tokens[req_idx])
+
+                # Copy scheduled tokens for this request (use .copy_() for proper tensor copy)
+                self.input_ids.cpu[extended_offset:extended_offset + num_sched].copy_(
+                    scheduled_tokens[scheduled_offset:scheduled_offset + num_sched]
+                )
+
+                # Copy scheduled positions for this request
+                positions_np[extended_offset:extended_offset + num_sched] = \
+                    scheduled_positions[scheduled_offset:scheduled_offset + num_sched]
+
+                # Copy lookahead tokens and positions for this request (if any)
+                if num_extra > 0 and req_id in active_lookahead:
+                    lookahead_tokens, _ = active_lookahead[req_id]
+                    for i in range(num_extra):
+                        self.input_ids.cpu[extended_offset + num_sched + i] = \
+                            lookahead_tokens[i]
+
+                    # Compute positions for lookahead tokens
+                    # They follow the last scheduled position for this request
+                    last_scheduled_pos = int(
+                        self.input_batch.num_computed_tokens_cpu[req_idx]
+                        + num_sched
+                        - 1
+                    )
+                    for i in range(num_extra):
+                        positions_np[extended_offset + num_sched + i] = \
+                            last_scheduled_pos + 1 + i
+
+                    import os
+                    if os.environ.get("DEBUG_LOOKAHEAD"):
+                        print(f"[DEBUG] _prepare_inputs: req_id={req_id}, extended_offset={extended_offset}, "
+                              f"num_sched={num_sched}, num_extra={num_extra}")
+                        print(f"[DEBUG]   input_ids[{extended_offset}:{extended_offset+num_sched+num_extra}] = "
+                              f"{self.input_ids.cpu[extended_offset:extended_offset+num_sched+num_extra].tolist()}")
+                        print(f"[DEBUG]   positions[{extended_offset}:{extended_offset+num_sched+num_extra}] = "
+                              f"{positions_np[extended_offset:extended_offset+num_sched+num_extra].tolist()}")
+
+                extended_offset += num_sched + num_extra
+                scheduled_offset += num_sched
+
+            if self.enable_prompt_embeds:
+                # For now, don't support prompt embeds with lookahead
+                # This would require similar interleaving logic
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                )
 
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
@@ -1446,20 +1679,36 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        # Compute slot mapping for ALL tokens including lookahead
+        # Lookahead tokens MUST be in KV cache for attention to see them
+        if total_lookahead_extra > 0:
+            # Build extended req_indices for ALL tokens (scheduled + lookahead)
+            extended_req_indices = np.repeat(
+                self.arange_np[:num_reqs], num_tokens_extended
+            )
 
-        # Prepare the attention metadata.
+            # Compute slot_mapping for all tokens using extended positions
+            self.input_batch.block_table.compute_slot_mapping(
+                extended_req_indices, positions_np[:total_num_tokens_extended]
+            )
+
+            self.input_batch.block_table.commit_slot_mapping(total_num_tokens_extended)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+            self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+
+        # Prepare the attention metadata with extended token counts
         self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens_extended
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens_extended[-1])
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
+        # seq_lens includes lookahead tokens for attention
         self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_tokens_extended
         )
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
@@ -1468,35 +1717,56 @@ class GPUModelRunner(
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
-        # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
-        self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+        # Record which requests should not be sampled
+        # Use original seq_lens (without lookahead) for this check
+        original_seq_lens = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
+        self.discard_request_mask.np[:num_reqs] = original_seq_lens < num_tokens_np
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
-        # Copy the tensors to the GPU.
-        self._prepare_input_ids(
-            scheduler_output,
-            total_num_scheduled_tokens,
-            cu_num_tokens,
-        )
+        # Copy the tensors to the GPU (with extended counts for lookahead)
+        if total_lookahead_extra == 0:
+            # No lookahead - use normal path
+            self._prepare_input_ids(
+                scheduler_output,
+                total_num_tokens_extended,
+                cu_num_tokens_extended,
+            )
+        else:
+            # With lookahead, we need to handle decode token scatter differently
+            # because the interleaved layout puts decode tokens at different positions
+            self._prepare_input_ids_lookahead(
+                scheduler_output,
+                total_num_tokens_extended,
+                cu_num_tokens_extended,
+                num_tokens_extended,
+                num_reqs,
+            )
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
+            self.mrope_positions.gpu[:, :total_num_tokens_extended].copy_(
+                self.mrope_positions.cpu[:, :total_num_tokens_extended],
                 non_blocking=True,
             )
         elif self.uses_xdrope_dim > 0:
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
+            self.xdrope_positions.gpu[:, :total_num_tokens_extended].copy_(
+                self.xdrope_positions.cpu[:, :total_num_tokens_extended],
                 non_blocking=True,
             )
         else:
             # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+            self.positions.copy_to_gpu(total_num_tokens_extended)
+
+        # Prepare lookahead metadata for requests with lookahead tokens
+        lookahead_metadata = self._prepare_lookahead_metadata(
+            num_reqs,
+            cu_num_tokens_extended,
+            active_lookahead,
+            num_lookahead_input_tokens,
+        )
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -1505,7 +1775,35 @@ class GPUModelRunner(
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            #
+            # For lookahead, we need to sample from the SCHEDULED token positions
+            # within the extended layout. The extended layout is:
+            # [req0_sched + req0_lookahead, req1_sched + req1_lookahead, ...]
+            #
+            # For each request, we sample from the LAST scheduled token position,
+            # which is at: cu_num_tokens_extended[i-1] + num_scheduled_tokens[i] - 1
+            # (or just num_scheduled_tokens[0] - 1 for the first request)
+            if total_lookahead_extra > 0:
+                # With lookahead, compute sample positions in extended layout
+                sample_positions = np.zeros(num_reqs, dtype=np.int64)
+                for req_idx in range(num_reqs):
+                    # Start of this request's tokens in extended layout
+                    if req_idx == 0:
+                        req_start = 0
+                    else:
+                        req_start = cu_num_tokens_extended[req_idx - 1]
+                    # Sample from last scheduled token (not lookahead)
+                    sample_positions[req_idx] = req_start + num_scheduled_tokens[req_idx] - 1
+                logits_indices = torch.from_numpy(sample_positions).to(self.device)
+            else:
+                # No lookahead - use original cumsum
+                original_query_start_loc = torch.zeros(
+                    num_reqs + 1, dtype=torch.long, device=self.device
+                )
+                original_query_start_loc[1:] = torch.from_numpy(
+                    cu_num_tokens.astype(np.int64)
+                ).to(self.device)
+                logits_indices = original_query_start_loc[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1554,6 +1852,8 @@ class GPUModelRunner(
         return (
             logits_indices,
             spec_decode_metadata,
+            lookahead_metadata,
+            total_num_tokens_extended,
         )
 
     def _build_attention_metadata(
@@ -2595,8 +2895,9 @@ class GPUModelRunner(
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
-        num_input_tokens: int,  # Padded
+        num_input_tokens: int,  # Padded (may include lookahead tokens)
         intermediate_tensors: IntermediateTensors | None = None,
+        num_tokens_for_embedding: int | None = None,  # For lookahead: extended count
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -2605,7 +2906,8 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Use extended count for embedding if provided (lookahead case)
+        num_scheduled_tokens = num_tokens_for_embedding or scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
 
@@ -2862,6 +3164,240 @@ class GPUModelRunner(
             req_id_to_index_output_copy,
             invalid_req_indices,
         )
+
+    def _calculate_lookahead_extension(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[np.ndarray, int, dict[str, tuple[list[int], float]]]:
+        """Calculate how many extra input tokens needed for lookahead.
+
+        For K lookahead tokens, we need K-1 extra input tokens
+        (lookahead[0:K-1]) to compute logits at K positions.
+
+        Args:
+            num_reqs: Number of requests in the batch
+            num_scheduled_tokens: Number of scheduled tokens per request
+
+        Returns:
+            Tuple of:
+            - num_lookahead_input_tokens: Extra input tokens per request (K-1)
+            - total_extra_tokens: Total extra tokens across all requests
+            - active_lookahead: Dict of req_id -> (lookahead_tokens, threshold)
+              for requests that will have lookahead this step
+        """
+        num_lookahead_input_tokens = np.zeros(num_reqs, dtype=np.int32)
+        active_lookahead: dict[str, tuple[list[int], float]] = {}
+
+        if not self.input_batch.lookahead_config:
+            return num_lookahead_input_tokens, 0, active_lookahead
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id not in self.input_batch.lookahead_config:
+                continue
+
+            lookahead_tokens, threshold = self.input_batch.lookahead_config[req_id]
+
+            # Check if this is prefill (processing prompt tokens) or decode
+            num_computed = self.input_batch.num_computed_tokens_cpu[req_idx]
+            num_prompt = self.input_batch.num_prompt_tokens[req_idx]
+            is_prefill = num_computed < num_prompt
+
+            num_lookahead = len(lookahead_tokens)
+            if num_lookahead == 0:
+                continue
+
+            import os
+            if os.environ.get("DEBUG_LOOKAHEAD"):
+                print(f"[DEBUG] _calculate_lookahead_extension: req_id={req_id}, "
+                      f"num_computed={num_computed}, num_prompt={num_prompt}, "
+                      f"is_prefill={is_prefill}, num_lookahead={num_lookahead}, "
+                      f"num_scheduled={num_scheduled_tokens[req_idx]}")
+
+            if is_prefill:
+                # During prefill, we can check lookahead at the end of prompt
+                # Only apply on the LAST prefill chunk (when we finish the prompt)
+                tokens_after_this_step = num_computed + num_scheduled_tokens[req_idx]
+                if tokens_after_this_step < num_prompt:
+                    # Not the last prefill chunk, skip
+                    if os.environ.get("DEBUG_LOOKAHEAD"):
+                        print(f"[DEBUG]   -> Skipping: tokens_after_this_step={tokens_after_this_step} < num_prompt={num_prompt}")
+                    continue
+                # For K lookahead tokens at prefill, we need K-1 extra input tokens
+                # Note: This extends the KV cache, so if we don't trigger, subsequent
+                # decoding may be affected. But this gives correct logprobs.
+                num_lookahead_input_tokens[req_idx] = num_lookahead - 1
+                if os.environ.get("DEBUG_LOOKAHEAD"):
+                    print(f"[DEBUG]   -> ACTIVE at prefill: num_lookahead_input={num_lookahead - 1}")
+            else:
+                # During decode, also check lookahead
+                # After sampling a token, we check if lookahead triggers
+                # For K lookahead tokens, we need K-1 extra input tokens
+                num_lookahead_input_tokens[req_idx] = num_lookahead - 1
+                if os.environ.get("DEBUG_LOOKAHEAD"):
+                    print(f"[DEBUG]   -> ACTIVE at decode: num_lookahead_input={num_lookahead - 1}")
+
+            active_lookahead[req_id] = (lookahead_tokens, threshold)
+
+        total_extra_tokens = int(num_lookahead_input_tokens.sum())
+        return num_lookahead_input_tokens, total_extra_tokens, active_lookahead
+
+    def _prepare_lookahead_metadata(
+        self,
+        num_reqs: int,
+        cu_num_tokens_extended: np.ndarray,
+        active_lookahead: dict[str, tuple[list[int], float]],
+        num_lookahead_input_tokens: np.ndarray,
+    ) -> LookaheadMetadata:
+        """Prepare metadata for lookahead token checking.
+
+        For each decode request with lookahead tokens, compute the indices
+        where we need to extract logits for lookahead evaluation.
+
+        With extended input (lookahead tokens appended), we need K positions
+        for K lookahead tokens:
+        - Position for lookahead[0]: last position of original scheduled tokens
+        - Position for lookahead[1]: first lookahead input position
+        - ...
+        - Position for lookahead[K-1]: last lookahead input position
+
+        Args:
+            num_reqs: Number of requests in the batch
+            cu_num_tokens_extended: Cumulative sum of tokens (including lookahead)
+            active_lookahead: Dict of req_id -> (lookahead_tokens, threshold)
+            num_lookahead_input_tokens: Extra input tokens per request (K-1)
+
+        Returns:
+            LookaheadMetadata with info for each lookahead request
+        """
+        # Early return if no active lookahead requests
+        if not active_lookahead:
+            return LookaheadMetadata.empty()
+
+        request_info: dict[str, tuple[int, int, list[int], float]] = {}
+        all_logits_indices: list[int] = []
+        current_logits_idx = 0
+
+        for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id not in active_lookahead:
+                continue
+
+            lookahead_tokens, threshold = active_lookahead[req_id]
+            num_lookahead = len(lookahead_tokens)
+            num_extra_input = num_lookahead_input_tokens[req_idx]
+
+            # The end position for this request (in extended token sequence)
+            end_pos = int(cu_num_tokens_extended[req_idx])
+
+            # Positions for logits extraction:
+            # - For lookahead[0]: end_pos - num_extra_input - 1 (last original token)
+            # - For lookahead[1]: end_pos - num_extra_input (first lookahead input)
+            # - ...
+            # - For lookahead[K-1]: end_pos - 1 (last lookahead input)
+            #
+            # This gives us K consecutive positions
+            base_logits_idx = end_pos - num_extra_input - 1
+
+            # Record info for this request
+            request_info[req_id] = (
+                current_logits_idx,  # Start index in our extracted logits
+                num_lookahead,       # Number of tokens to check
+                lookahead_tokens,    # The actual token IDs
+                threshold,           # Threshold for acceptance
+            )
+
+            import os
+            if os.environ.get("DEBUG_LOOKAHEAD"):
+                print(f"[DEBUG] _prepare_lookahead_metadata: req_id={req_id}, "
+                      f"end_pos={end_pos}, num_extra_input={num_extra_input}, "
+                      f"base_logits_idx={base_logits_idx}, num_lookahead={num_lookahead}")
+                print(f"[DEBUG]   logits indices: {[base_logits_idx + i for i in range(num_lookahead)]}")
+                print(f"[DEBUG]   lookahead_tokens: {lookahead_tokens}")
+
+            # Add all K positions to logits_indices
+            for i in range(num_lookahead):
+                all_logits_indices.append(base_logits_idx + i)
+            current_logits_idx += num_lookahead
+
+        if not request_info:
+            return LookaheadMetadata.empty()
+
+        logits_indices = torch.tensor(
+            all_logits_indices, dtype=torch.long, device=self.device
+        )
+
+        return LookaheadMetadata(
+            request_info=request_info,
+            logits_indices=logits_indices,
+            total_lookahead_tokens=len(all_logits_indices),
+        )
+
+    def _check_lookahead_termination(
+        self,
+        logits: torch.Tensor,
+        lookahead_metadata: LookaheadMetadata,
+        valid_sampled_token_ids: list[list[int]],
+    ) -> dict[str, list[int]]:
+        """Check if any requests should terminate due to lookahead threshold.
+
+        For each request with lookahead tokens, compute the sum of logprobs
+        for all lookahead tokens at their respective positions:
+        - P(lookahead[0] | context) at position N-1
+        - P(lookahead[1] | context, lookahead[0]) at position N
+        - ...
+        - P(lookahead[K-1] | context, lookahead[0:K-1]) at position N+K-2
+
+        Args:
+            logits: The output logits from the model forward pass
+            lookahead_metadata: Metadata about lookahead requests
+            valid_sampled_token_ids: The sampled token IDs per request
+
+        Returns:
+            Dict mapping req_id -> lookahead_token_ids for terminated requests
+        """
+        lookahead_terminated: dict[str, list[int]] = {}
+
+        # Early return if no lookahead requests
+        if lookahead_metadata.total_lookahead_tokens == 0:
+            return lookahead_terminated
+
+        # Extract logits at all lookahead positions
+        lookahead_logits = logits[lookahead_metadata.logits_indices]
+
+        # Compute logprobs for all positions
+        logprobs = torch.log_softmax(lookahead_logits.float(), dim=-1)
+
+        for req_id, (start_idx, num_tokens, token_ids, threshold) in (
+            lookahead_metadata.request_info.items()
+        ):
+            # Get logprobs at all K positions for this request
+            # start_idx points to the first position, we need num_tokens positions
+            req_logprobs = logprobs[start_idx:start_idx + num_tokens]
+
+            # Get the logprob of each lookahead token at its corresponding position
+            # token_ids[i] should be evaluated at position start_idx + i
+            token_ids_tensor = torch.tensor(
+                token_ids, dtype=torch.long, device=logprobs.device
+            )
+            # Use advanced indexing: logprobs[i, token_ids[i]] for each i
+            token_logprobs = req_logprobs[
+                torch.arange(num_tokens, device=logprobs.device),
+                token_ids_tensor
+            ]
+
+            # Sum all logprobs and compare to threshold
+            total_logprob = token_logprobs.sum().item()
+
+            if total_logprob > threshold:
+                # Terminate and use lookahead tokens as output
+                lookahead_terminated[req_id] = token_ids
+
+                # Clear the sampled token for this request
+                req_idx = self.input_batch.req_id_to_index.get(req_id)
+                if req_idx is not None and req_idx < len(valid_sampled_token_ids):
+                    valid_sampled_token_ids[req_idx] = []
+
+        return lookahead_terminated
 
     @contextmanager
     def synchronize_input_prep(self):
@@ -3162,10 +3698,25 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
+            logits_indices, spec_decode_metadata, lookahead_metadata, total_num_tokens_extended = (
+                self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
             )
+
+            # Use extended token count when lookahead is active
+            max_query_len_for_attn = max_num_scheduled_tokens
+            if lookahead_metadata.total_lookahead_tokens > 0:
+                num_tokens_unpadded = total_num_tokens_extended
+                # Also update max_query_len for attention metadata
+                # Each request with lookahead has more tokens
+                num_tokens_extended = (
+                    total_num_tokens_extended // num_reqs
+                    if total_num_tokens_extended % num_reqs == 0
+                    else max(1, total_num_tokens_extended // num_reqs + 1)
+                )
+                max_query_len_for_attn = max(max_query_len_for_attn, num_tokens_extended)
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3192,6 +3743,11 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
+            # For lookahead batches, use the batch descriptor from the dispatcher
+            # which will find appropriate CUDA graphs for the extended batch size.
+            # The dispatcher receives num_tokens=total_num_tokens_extended (set above)
+            # so it should find matching piecewise graphs if available.
+
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                 "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -3205,6 +3761,7 @@ class GPUModelRunner(
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
+
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -3230,7 +3787,7 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
+                    max_query_len=max_query_len_for_attn,
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
@@ -3238,6 +3795,11 @@ class GPUModelRunner(
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
             )
+
+            # Pass extended token count for embedding if lookahead is active
+            num_tokens_for_embedding = None
+            if lookahead_metadata.total_lookahead_tokens > 0:
+                num_tokens_for_embedding = total_num_tokens_extended
 
             (
                 input_ids,
@@ -3247,7 +3809,10 @@ class GPUModelRunner(
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+                scheduler_output,
+                num_tokens_padded,
+                intermediate_tensors,
+                num_tokens_for_embedding,
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -3308,11 +3873,22 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                # When lookahead is active, compute logits for ALL positions
+                # so we can check lookahead termination
+                sampling_logits = None
+                if lookahead_metadata.total_lookahead_tokens > 0:
+                    # Compute logits for all extended positions
+                    logits = self.model.compute_logits(hidden_states)
+                    # Extract sampling logits at scheduled positions
+                    sampling_logits = logits[logits_indices]
+                    sample_hidden_states = hidden_states[logits_indices]
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+                sampling_logits = None  # Not used in PP case
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -3350,6 +3926,8 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            lookahead_metadata,
+            sampling_logits,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3386,18 +3964,24 @@ class GPUModelRunner(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            lookahead_metadata,
+            sampling_logits,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # When lookahead is active, use sampling_logits for sampling
+        # (logits contains extended positions for lookahead checking)
+        logits_for_sampling = sampling_logits if sampling_logits is not None else logits
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
+                scheduler_output, grammar_output, self.input_batch, logits_for_sampling
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits_for_sampling, spec_decode_metadata)
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3471,7 +4055,7 @@ class GPUModelRunner(
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
-                logits,
+                logits_for_sampling,  # Use sampling logits for bookkeeping
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
@@ -3488,6 +4072,13 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+
+        # Check for lookahead termination
+        with record_function_or_nullcontext("gpu_model_runner: lookahead_check"):
+            lookahead_terminated = self._check_lookahead_termination(
+                logits, lookahead_metadata, valid_sampled_token_ids
+            ) if logits is not None else {}
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -3501,6 +4092,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                lookahead_terminated=lookahead_terminated,
             )
 
         if not self.use_async_scheduling:

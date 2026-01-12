@@ -1062,6 +1062,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        lookahead_terminated = model_runner_output.lookahead_terminated
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1139,8 +1140,48 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # Check for lookahead termination
+            if req_id in lookahead_terminated:
+                lookahead_tokens = lookahead_terminated[req_id]
+
+                # Check if we're at prefill or decode:
+                # - Prefill: num_computed_tokens < num_prompt_tokens
+                # - Decode: num_computed_tokens >= num_prompt_tokens
+                # When num_computed == num_prompt, we just finished prefill
+                # and sampled our first output token, so treat as decode
+                at_prefill_start = (request.num_computed_tokens
+                                    < request.num_prompt_tokens)
+
+                if at_prefill_start and request._output_token_ids:
+                    # At prefill start with async scheduling, clear any
+                    # stale output that was added before we processed
+                    request._output_token_ids.clear()
+                    prompt_len = request.num_prompt_tokens
+                    del request._all_token_ids[prompt_len:]
+
+                # Build the FULL output token list for lookahead termination:
+                # existing_tokens + this_step_token + lookahead_tokens
+                # The output_processor will use this to replace detokenizer
+                # tokens entirely (it clears then adds new_token_ids)
+                existing_tokens = list(request._output_token_ids)
+                if generated_token_ids:
+                    new_token_ids = (existing_tokens +
+                                     list(generated_token_ids) +
+                                     list(lookahead_tokens))
+                else:
+                    new_token_ids = existing_tokens + list(lookahead_tokens)
+
+                # Append only the NEW tokens to request's output
+                # (existing are already there)
+                tokens_to_append = (list(generated_token_ids) +
+                                    list(lookahead_tokens)
+                                    if generated_token_ids else lookahead_tokens)
+                request.append_output_token_ids(tokens_to_append)
+
+                request.status = RequestStatus.FINISHED_LOOKAHEAD
+                stopped = True
             # Check for stop and update request status.
-            if new_token_ids:
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )

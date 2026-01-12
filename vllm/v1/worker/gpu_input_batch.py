@@ -54,6 +54,10 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # Lookahead tokens for early termination feature
+    lookahead_token_ids: list[int] | None = None
+    lookahead_threshold: float | None = None
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -264,6 +268,10 @@ class InputBatch:
         self.pooling_params: dict[str, PoolingParams] = {}
         self.pooling_states: dict[str, PoolingStates] = {}
 
+        # Lookahead tokens for early termination feature
+        # Maps req_id -> (lookahead_token_ids, threshold)
+        self.lookahead_config: dict[str, tuple[list[int], float]] = {}
+
         # Cached reference to the GPU tensor of previously sampled tokens
         self.prev_sampled_token_ids: torch.Tensor | None = None
         self.prev_req_id_to_index: dict[str, int] | None = None
@@ -431,6 +439,16 @@ class InputBatch:
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
+        # Store lookahead configuration if present
+        if (
+            request.lookahead_token_ids is not None
+            and request.lookahead_threshold is not None
+        ):
+            self.lookahead_config[req_id] = (
+                request.lookahead_token_ids,
+                request.lookahead_threshold,
+            )
+
         # Add request lora ID
         if request.lora_request:
             lora_id = request.lora_request.lora_int_id
@@ -474,6 +492,9 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        # Clean up lookahead config
+        self.lookahead_config.pop(req_id, None)
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)

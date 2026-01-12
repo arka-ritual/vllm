@@ -47,6 +47,10 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Lookahead tokens for early termination feature
+    lookahead_token_ids: list[int] | None = None
+    lookahead_threshold: float | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -65,6 +69,8 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            lookahead_token_ids=request.lookahead_token_ids,
+            lookahead_threshold=request.lookahead_threshold,
         )
 
     def __repr__(self) -> str:
