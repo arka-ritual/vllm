@@ -1136,53 +1136,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_reqs, cu_num_tokens_extended, active_lookahead,
             num_lookahead_input_tokens)
 
-        # Compute slot mapping for scheduled tokens only (not lookahead)
-        # Lookahead tokens should NOT write to KV cache - use -1 (PAD_SLOT_ID)
+        # Compute slot mapping for ALL tokens (including lookahead)
+        # NOTE: Lookahead tokens MUST write to KV cache so attention can see
+        # them. The slots are computed based on position, same as regular tokens.
+        # After the forward pass, if lookahead triggers, these become permanent;
+        # if not, the next step's decode token will overwrite the lookahead slots.
         if total_lookahead_extra > 0:
-            # First compute slot_mapping for scheduled tokens using ORIGINAL
-            # positions (not the extended ones that include lookahead)
-            # scheduled_positions was saved earlier
+            # Build req_indices and positions for all extended tokens
+            extended_req_indices = np.repeat(self.arange_np[:num_reqs],
+                                             num_tokens_extended)
+            # positions_np already has positions for all extended tokens
+            extended_positions = positions_np[:total_num_tokens_extended]
+
+            # Compute slot_mapping for all tokens (scheduled + lookahead)
             self.input_batch.block_table.compute_slot_mapping(
-                req_indices, scheduled_positions)
-
-            # Now we need to interleave the slot_mapping for extended layout
-            # Handle all KV cache groups
-            num_kv_groups = len(self.input_batch.block_table.block_tables)
-            for gid in range(num_kv_groups):
-                block_table = self.input_batch.block_table[gid]
-
-                # Get the computed slot_mapping for scheduled tokens
-                # Note: v0.10 uses slot_mapping_np, not slot_mapping.np
-                scheduled_slot_mapping = block_table.slot_mapping_np[
-                    :total_num_scheduled_tokens].copy()
-
-                # Build extended slot_mapping with -1 for lookahead positions
-                extended_slot_mapping = np.full(total_num_tokens_extended,
-                                                -1,
-                                                dtype=np.int64)
-
-                # Copy scheduled token slot_mapping to correct interleaved pos
-                scheduled_offset = 0
-                extended_offset = 0
-                for req_idx in range(num_reqs):
-                    n_sched = int(num_scheduled_tokens[req_idx])
-                    n_extra = int(num_lookahead_input_tokens[req_idx])
-
-                    # Copy scheduled slot mappings
-                    extended_slot_mapping[
-                        extended_offset:extended_offset +
-                        n_sched] = scheduled_slot_mapping[
-                            scheduled_offset:scheduled_offset + n_sched]
-
-                    # Lookahead positions remain -1 (PAD_SLOT_ID)
-
-                    extended_offset += n_sched + n_extra
-                    scheduled_offset += n_sched
-
-                # Write extended slot_mapping back
-                block_table.slot_mapping_np[:total_num_tokens_extended] = \
-                    extended_slot_mapping
-
+                extended_req_indices, extended_positions)
             self.input_batch.block_table.commit_slot_mapping(
                 total_num_tokens_extended)
         else:
@@ -2048,6 +2016,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
             lookahead_terminated={},  # Pooling models don't use lookahead
+            lookahead_logprobs={},
         )
 
     def _preprocess(
@@ -2229,15 +2198,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_prompt = self.input_batch.num_prompt_tokens[req_idx]
             num_scheduled = num_scheduled_tokens[req_idx]
             tokens_after_step = num_computed + num_scheduled
-            
+
             # Skip if we won't complete prefill in this step
             if tokens_after_step < num_prompt:
                 continue
-            
+
             # Skip chunked prefill with multiple tokens (complex case)
             # Only handle: end of prefill (num_scheduled > 1) or normal decode (num_scheduled == 1)
             if num_scheduled > 1 and num_computed > 0:
-                # This is chunked prefill in the middle, skip
                 continue
 
             num_lookahead = len(lookahead_tokens)
@@ -2332,7 +2300,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logits: Optional[torch.Tensor],
         lookahead_metadata: LookaheadMetadata,
         valid_sampled_token_ids: list[list[int]],
-    ) -> dict[str, list[int]]:
+    ) -> tuple[dict[str, list[int]], dict[str, list[float]]]:
         """Check if any requests should terminate due to lookahead threshold.
 
         For each request with lookahead tokens, compute the sum of logprobs
@@ -2348,16 +2316,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             valid_sampled_token_ids: The sampled token IDs per request
 
         Returns:
-            Dict mapping req_id -> lookahead_token_ids for terminated requests
+            Tuple of:
+            - Dict mapping req_id -> lookahead_token_ids for terminated requests
+            - Dict mapping req_id -> lookahead_logprobs for terminated requests
         """
         lookahead_terminated: dict[str, list[int]] = {}
+        lookahead_logprobs_dict: dict[str, list[float]] = {}
 
         # Early return if no lookahead requests
         if lookahead_metadata.total_lookahead_tokens == 0:
-            return lookahead_terminated
+            return lookahead_terminated, lookahead_logprobs_dict
 
         if logits is None:
-            return lookahead_terminated
+            return lookahead_terminated, lookahead_logprobs_dict
 
         # Extract logits at all lookahead positions
         assert lookahead_metadata.logits_indices is not None
@@ -2384,13 +2355,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_logprob = token_logprobs.sum().item()
 
             if total_logprob > threshold:
-                print(f"Terminating request {req_id} with total logprob {total_logprob} and threshold {threshold}")
-                print(f"Token IDs: {token_ids}")
-                print(f"Token logprobs: {token_logprobs}")
-                print()
-                
                 # Terminate and use lookahead tokens as output
                 lookahead_terminated[req_id] = token_ids
+                lookahead_logprobs_dict[req_id] = token_logprobs.tolist()
 
                 # Clear the sampled token for this request
                 req_idx = self.input_batch.req_id_to_index.get(req_id)
@@ -2408,7 +2375,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         self.input_batch.num_tokens[req_idx] -= num_sampled
                     valid_sampled_token_ids[req_idx] = []
 
-        return lookahead_terminated
+        return lookahead_terminated, lookahead_logprobs_dict
 
     def _bookkeeping_sync(
         self, scheduler_output: "SchedulerOutput",
@@ -2712,7 +2679,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         lookahead_check_logits = (lookahead_full_logits
                                   if lookahead_full_logits is not None else
                                   logits)
-        lookahead_terminated = self._check_lookahead_termination(
+        lookahead_terminated, lookahead_logprobs = self._check_lookahead_termination(
             lookahead_check_logits, lookahead_metadata, valid_sampled_token_ids)
 
         output = ModelRunnerOutput(
@@ -2725,6 +2692,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
             lookahead_terminated=lookahead_terminated,
+            lookahead_logprobs=lookahead_logprobs,
         )
 
         if not self.use_async_scheduling:

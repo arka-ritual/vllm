@@ -30,7 +30,7 @@ from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, LogprobsLists, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -871,6 +871,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         lookahead_terminated = model_runner_output.lookahead_terminated
+        lookahead_logprobs = model_runner_output.lookahead_logprobs
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
@@ -923,6 +924,18 @@ class Scheduler(SchedulerInterface):
                 request.append_output_token_ids(new_token_ids)
                 request.status = RequestStatus.FINISHED_LOOKAHEAD
                 stopped = True
+
+                # Construct logprobs for lookahead tokens
+                if req_id in lookahead_logprobs:
+                    la_logprobs = lookahead_logprobs[req_id]
+                    # LogprobsLists expects per-token lists
+                    # Each token has a list of (token_id, logprob) pairs for top-k
+                    # For lookahead, we only have the logprob for the specific token
+                    new_logprobs = LogprobsLists(
+                        logprob_token_ids=[[tid] for tid in new_token_ids],
+                        logprobs=[[lp] for lp in la_logprobs],
+                        sampled_token_ranks=[0] * len(new_token_ids),
+                    )
             # Check for stop and update request status.
             elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -943,7 +956,8 @@ class Scheduler(SchedulerInterface):
                     stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None \
+            # Skip if new_logprobs was already set (e.g., by lookahead)
+            if new_logprobs is None and request.sampling_params is not None \
                 and request.sampling_params.logprobs is not None and logprobs:
                 # NOTE: once we support N tokens per step (spec decode),
                 # the outer lists can be of length > 1.

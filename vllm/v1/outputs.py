@@ -119,6 +119,10 @@ class ModelRunnerOutput:
     # contains the lookahead tokens to append to output.
     lookahead_terminated: dict[str, list[int]] = field(default_factory=dict)
 
+    # Lookahead logprobs: req_id -> list of logprobs for lookahead tokens
+    # Contains the per-token logprobs for terminated lookahead requests.
+    lookahead_logprobs: dict[str, list[float]] = field(default_factory=dict)
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
