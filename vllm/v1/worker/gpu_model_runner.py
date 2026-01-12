@@ -1114,10 +1114,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 # Copy lookahead tokens and positions for this request (if any)
                 if num_extra > 0 and req_id in active_lookahead:
-                    lookahead_tokens, _ = active_lookahead[req_id]
+                    remaining_tokens, _, _ = active_lookahead[req_id]
                     for i in range(num_extra):
                         self.input_ids.cpu[extended_offset + num_sched + i] = \
-                            lookahead_tokens[i]
+                            remaining_tokens[i]
 
                     # Compute positions for lookahead tokens
                     # They follow the last scheduled position for this request
@@ -2158,11 +2158,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[np.ndarray, int, dict[str, tuple[list[int], float]]]:
+    ) -> tuple[np.ndarray, int, dict[str, tuple[list[int], float, int]]]:
         """Calculate how many extra input tokens needed for lookahead.
 
-        For K lookahead tokens, we need K-1 extra input tokens
-        (lookahead[0:K-1]) to compute logits at K positions.
+        For K remaining lookahead tokens, we need K-1 extra input tokens
+        (remaining_lookahead[0:K-1]) to compute logits at K positions.
+
+        Supports partial matching: if the model has already generated tokens
+        that match the prefix of the lookahead answer, we only check the
+        probability of the remaining tokens.
 
         Args:
             num_reqs: Number of requests in the batch
@@ -2172,11 +2176,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             Tuple of:
             - num_lookahead_input_tokens: Extra input tokens per request (K-1)
             - total_extra_tokens: Total extra tokens across all requests
-            - active_lookahead: Dict of req_id -> (lookahead_tokens, threshold)
-              for requests that will have lookahead this step
+            - active_lookahead: Dict of req_id -> (remaining_tokens, threshold, match_offset)
+              for requests that will have lookahead this step.
+              match_offset is how many lookahead tokens were already generated.
         """
         num_lookahead_input_tokens = np.zeros(num_reqs, dtype=np.int32)
-        active_lookahead: dict[str, tuple[list[int], float]] = {}
+        active_lookahead: dict[str, tuple[list[int], float, int]] = {}
 
         if not self.input_batch.lookahead_config:
             return num_lookahead_input_tokens, 0, active_lookahead
@@ -2212,10 +2217,37 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if num_lookahead == 0:
                 continue
 
-            # For K lookahead tokens, we need K-1 extra input tokens
-            # (we feed lookahead[0:K-1] to get logits for lookahead[0:K])
-            num_lookahead_input_tokens[req_idx] = num_lookahead - 1
-            active_lookahead[req_id] = (lookahead_tokens, threshold)
+            # Check how many tokens at the END of output match the START of lookahead
+            # Example: output=[" is", " Paris"], lookahead=[" Paris", " which", ...]
+            # The last 1 token of output (" Paris") matches lookahead[0], so match_offset=1
+            req_state = self.requests.get(req_id)
+            match_offset = 0
+            if req_state is not None:
+                output_tokens = req_state.output_token_ids
+                num_output = len(output_tokens)
+                # Try matching last K tokens of output with first K tokens of lookahead
+                # Start from longest possible match and work down
+                max_possible_match = min(num_output, num_lookahead)
+                for k in range(max_possible_match, 0, -1):
+                    # Check if output[-k:] == lookahead[:k]
+                    output_suffix = output_tokens[-k:]
+                    lookahead_prefix = lookahead_tokens[:k]
+                    if output_suffix == list(lookahead_prefix):
+                        match_offset = k
+                        break
+
+            # Remaining lookahead tokens to check (those not already generated)
+            remaining_tokens = lookahead_tokens[match_offset:]
+            num_remaining = len(remaining_tokens)
+
+            if num_remaining == 0:
+                # All lookahead tokens already generated - nothing to check
+                continue
+
+            # For K remaining tokens, we need K-1 extra input tokens
+            # (we feed remaining[0:K-1] to get logits for remaining[0:K])
+            num_lookahead_input_tokens[req_idx] = num_remaining - 1
+            active_lookahead[req_id] = (remaining_tokens, threshold, match_offset)
 
         total_extra_tokens = int(num_lookahead_input_tokens.sum())
         return num_lookahead_input_tokens, total_extra_tokens, active_lookahead
@@ -2224,7 +2256,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         num_reqs: int,
         cu_num_tokens: np.ndarray,
-        active_lookahead: dict[str, tuple[list[int], float]],
+        active_lookahead: dict[str, tuple[list[int], float, int]],
         num_lookahead_input_tokens: np.ndarray,
     ) -> LookaheadMetadata:
         """Prepare metadata for lookahead token checking.
@@ -2235,7 +2267,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Args:
             num_reqs: Number of requests in the batch
             cu_num_tokens: Cumulative sum of tokens (including lookahead)
-            active_lookahead: Dict of req_id -> (lookahead_tokens, threshold)
+            active_lookahead: Dict of req_id -> (remaining_tokens, threshold, match_offset)
             num_lookahead_input_tokens: Extra input tokens per request (K-1)
 
         Returns:
@@ -2253,7 +2285,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if req_id not in active_lookahead:
                 continue
 
-            lookahead_tokens, threshold = active_lookahead[req_id]
+            # remaining_tokens are the lookahead tokens that haven't been generated yet
+            remaining_tokens, threshold, _match_offset = active_lookahead[req_id]
+            lookahead_tokens = remaining_tokens  # Use remaining tokens for logit computation
             num_lookahead = len(lookahead_tokens)
             num_extra_input = num_lookahead_input_tokens[req_idx]
 
