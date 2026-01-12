@@ -50,6 +50,30 @@ def test_longer_lookahead():
             "threshold_pass": -4.0,     # Below exact -> should trigger
             "threshold_fail": -2.9,     # Above exact -> should NOT trigger
         },
+        {
+            "name": "Baseline for the next test",
+            "prompt": "The capital of France is",
+            "lookahead": " Paris which is a beautiful city.",
+            "exact_logprob": -18.125,  # Measured from model
+            "threshold_pass": -19.0,     # Below exact -> should trigger
+            "threshold_fail": -17.5,     # Above exact -> should NOT trigger
+        },
+        {
+            "name": "Sample first, then lookahead",
+            "prompt": "The capital of France",  # expecting to sample 'is'
+            "lookahead": " Paris which is a beautiful city.",
+            "exact_logprob": -18.125,  # Measured from model
+            "threshold_pass": -19.0,     # Below exact -> should trigger
+            "threshold_fail": -17.5,     # Above exact -> should NOT trigger
+        },
+        {
+            "name": "Sample many tokens, then lookahead",
+            "prompt": "The capital of France",  # expecting to sample 'is Paris.'
+            "lookahead": " The capital of France is also the capital of the Republic of France.",
+            "exact_logprob": -9.4375,  # Measured from model
+            "threshold_pass": -10.0,     # Below exact -> should trigger
+            "threshold_fail": -9.0,     # Above exact -> should NOT trigger
+        },
     ]
 
     # Show token counts for each lookahead
@@ -102,6 +126,7 @@ def test_longer_lookahead():
             print(f"  PASS: Triggered as expected (threshold below exact)")
         else:
             print(f"  FAIL: Did NOT trigger! Threshold {tc['threshold_pass']} < exact {tc['exact_logprob']}")
+            print(f"Output tokens: '{tokenizer.encode(output_text, add_special_tokens=False)}")
             all_passed = False
 
     # =========================================================================
@@ -131,12 +156,13 @@ def test_longer_lookahead():
 
         print(f"\n--- {tc['name']} (threshold={tc['threshold_fail']}, exact={tc['exact_logprob']}) ---")
         print(f"  finish_reason: {finish_reason}")
-        print(f"  Output: '{output_text[:60]}...' ({len(output_tokens)} tokens)")
+        print(f"  Output: '{output_text}' ({len(output_tokens)} tokens)")
 
         if not triggered:
             print(f"  PASS: Did NOT trigger as expected (threshold above exact)")
         else:
             print(f"  FAIL: Triggered unexpectedly! Threshold {tc['threshold_fail']} > exact {tc['exact_logprob']}")
+            print(f"Output tokens: '{tokenizer.encode(output_text, add_special_tokens=False)}")
             all_passed = False
 
     # =========================================================================

@@ -122,9 +122,8 @@ def test_threshold_zero_matches_baseline():
         # Check token IDs match exactly
         if regular_ids != lookahead_ids:
             print(f"  FAIL: Prompt {i} - token mismatch")
-            print(f"    Regular ({len(regular_ids)} tokens): {outputs[regular_idx].outputs[0].text[:50]}...")
-            print(f"    Lookahead ({len(lookahead_ids)} tokens): {outputs[lookahead_idx].outputs[0].text[:50]}...")
-            import pdb; pdb.set_trace()
+            print(f"    Regular ({len(regular_ids)} tokens): {outputs[regular_idx].outputs[0].text}")
+            print(f"    Lookahead ({len(lookahead_ids)} tokens): {outputs[lookahead_idx].outputs[0].text}")
             all_match = False
         else:
             print(f"  PASS: Prompt {i} - {len(regular_ids)} tokens match")

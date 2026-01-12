@@ -912,3 +912,62 @@ With this fix, lookahead tokens ARE written to the KV cache. This means:
 For case 2, the scheduler handles this by not incrementing `num_computed_tokens` for lookahead tokens. On subsequent decode iterations, the model will overwrite those KV cache positions with actual generated tokens.
 
 ---
+
+## BUG FIX: Lookahead Now Works During Decode Phase (Jan 12, 2026)
+
+### The Problem
+
+Lookahead checking was only happening during PREFILL, not during DECODE. This meant that if a prompt required sampling one token before the lookahead would match, the lookahead would never trigger.
+
+**Example**:
+- Prompt: "The capital of France" (without " is")
+- Lookahead: " Paris which is a beautiful city."
+- With temp=0, model samples " is" first
+- After sampling, context becomes "The capital of France is"
+- NOW the lookahead should trigger (same as if prompt had " is")
+- But it DIDN'T because decode phase was skipped!
+
+### Root Cause
+
+In `_calculate_lookahead_extension()`, the decode phase was explicitly skipped:
+
+```python
+else:
+    # During decode, skip lookahead checking
+    # The correct check happens at prefill time
+    if os.environ.get("DEBUG_LOOKAHEAD"):
+        print(f"[DEBUG]   -> Skipping decode phase")
+    continue
+```
+
+### The Fix
+
+Changed the code to enable lookahead during decode with the same logic as prefill:
+
+```python
+else:
+    # During decode, also check lookahead
+    # After sampling a token, we check if lookahead triggers
+    # For K lookahead tokens, we need K-1 extra input tokens
+    num_lookahead_input_tokens[req_idx] = num_lookahead - 1
+    if os.environ.get("DEBUG_LOOKAHEAD"):
+        print(f"[DEBUG]   -> ACTIVE at decode: num_lookahead_input={num_lookahead - 1}")
+```
+
+### How Decode Lookahead Works
+
+During decode for K lookahead tokens:
+1. Input is: [sampled_token, lookahead[0], lookahead[1], ..., lookahead[K-2]] = K tokens
+2. Positions are: [N, N+1, N+2, ..., N+K-1] where N is the decode position
+3. Logits[i] predicts position N+1+i, which should be lookahead[i]
+4. We check all K logprobs against the threshold
+
+### Test Results
+
+All 4 test cases now pass:
+- "Paris/Madrid" - triggers at prefill ✓
+- "Pacific Ocean" - triggers at prefill ✓
+- "Baseline for the next test" - triggers at prefill ✓
+- "Sample first, then lookahead" - triggers at DECODE after sampling " is" ✓
+
+---

@@ -1151,21 +1151,42 @@ class Scheduler(SchedulerInterface):
 
             # Check for lookahead termination
             if req_id in lookahead_terminated:
-                # Use lookahead tokens instead of sampled tokens
-                new_token_ids = lookahead_terminated[req_id]
+                lookahead_tokens = lookahead_terminated[req_id]
 
-                # When lookahead triggers, we need to replace any existing output
-                # tokens that were sampled during prefill. With async scheduling,
-                # prefill may have already added a token before we process this
-                # decode step's output where lookahead actually triggered.
-                # Clear existing output and replace with just the lookahead tokens.
-                if request._output_token_ids:
+                # Check if we're at prefill or decode:
+                # - Prefill: num_computed_tokens < num_prompt_tokens
+                # - Decode: num_computed_tokens >= num_prompt_tokens
+                # When num_computed == num_prompt, we just finished prefill
+                # and sampled our first output token, so treat as decode
+                at_prefill_start = (request.num_computed_tokens
+                                    < request.num_prompt_tokens)
+
+                if at_prefill_start and request._output_token_ids:
+                    # At prefill start with async scheduling, clear any
+                    # stale output that was added before we processed
                     request._output_token_ids.clear()
-                    # Also clear from _all_token_ids (keep prompt tokens only)
                     prompt_len = request.num_prompt_tokens
                     del request._all_token_ids[prompt_len:]
 
-                request.append_output_token_ids(new_token_ids)
+                # Build the FULL output token list for lookahead termination:
+                # existing_tokens + this_step_token + lookahead_tokens
+                # The output_processor will use this to replace detokenizer
+                # tokens entirely (it clears then adds new_token_ids)
+                existing_tokens = list(request._output_token_ids)
+                if generated_token_ids:
+                    new_token_ids = (existing_tokens +
+                                     list(generated_token_ids) +
+                                     list(lookahead_tokens))
+                else:
+                    new_token_ids = existing_tokens + list(lookahead_tokens)
+
+                # Append only the NEW tokens to request's output
+                # (existing are already there)
+                tokens_to_append = (list(generated_token_ids) +
+                                    list(lookahead_tokens)
+                                    if generated_token_ids else lookahead_tokens)
+                request.append_output_token_ids(tokens_to_append)
+
                 request.status = RequestStatus.FINISHED_LOOKAHEAD
                 stopped = True
             # Check for stop and update request status.

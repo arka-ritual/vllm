@@ -3233,11 +3233,12 @@ class GPUModelRunner(
                 if os.environ.get("DEBUG_LOOKAHEAD"):
                     print(f"[DEBUG]   -> ACTIVE at prefill: num_lookahead_input={num_lookahead - 1}")
             else:
-                # During decode, skip lookahead checking
-                # The correct check happens at prefill time
+                # During decode, also check lookahead
+                # After sampling a token, we check if lookahead triggers
+                # For K lookahead tokens, we need K-1 extra input tokens
+                num_lookahead_input_tokens[req_idx] = num_lookahead - 1
                 if os.environ.get("DEBUG_LOOKAHEAD"):
-                    print(f"[DEBUG]   -> Skipping decode phase")
-                continue
+                    print(f"[DEBUG]   -> ACTIVE at decode: num_lookahead_input={num_lookahead - 1}")
 
             active_lookahead[req_id] = (lookahead_tokens, threshold)
 
